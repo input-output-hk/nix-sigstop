@@ -1,0 +1,17 @@
+.{
+    .name = "nix-sigstop",
+    .version = "0.0.0",
+    .dependencies = .{
+        .lib = .{ .path = "../lib" },
+        .@"known-folders" = .{
+            .url = "https://github.com/ziglibs/known-folders/archive/bf79988adcfce166f848e4b11e718c1966365329.tar.gz",
+            .hash = "12201314cffeb40c5e4e3da166217d2c74628c74486414aaf97422bcd2279915b9fd",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "main.zig",
+        "../lib",
+    },
+}
