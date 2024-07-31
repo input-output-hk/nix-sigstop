@@ -7,7 +7,7 @@ const nix = lib.nix;
 pub const std_options = .{
     .logFn = struct {
         fn logFn(comptime message_level: std.log.Level, comptime scope: @Type(.EnumLiteral), comptime format: []const u8, args: anytype) void {
-            switch (mode) {
+            switch (globals) {
                 .wrapper => std.log.defaultLog(message_level, scope, format, args),
                 .build_hook => nix.log.logFn(message_level, scope, format, args),
             }
@@ -21,7 +21,11 @@ const hook_arg = "__build-hook";
 /// Only works if the eval store is a chroot store!
 const symlink_ifds_into_eval_store = true;
 
-var mode: enum { wrapper, build_hook } = .wrapper;
+var globals: union(enum) {
+    /// The PID of the nix client process.
+    wrapper: ?std.process.Child.Id,
+    build_hook,
+} = .{ .wrapper = null };
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -39,8 +43,41 @@ pub fn main() !void {
         else
             false;
     }) {
-        mode = .build_hook;
+        globals = .build_hook;
         return buildHook(allocator);
+    }
+
+    {
+        const sa = std.posix.Sigaction{
+            .handler = .{
+                .handler = struct {
+                    fn handler(sig: c_int) callconv(.C) void {
+                        // Instead of just exiting upon receiving the signal,
+                        // we want to have the nix client process exit
+                        // so that we properly clean up all resources
+                        // the normal way via `defer` statements
+                        // after waiting on it at the end of `main()`.
+
+                        if (globals.wrapper) |nix_process_id| {
+                            // We need to send `SIGCONT` so that the nix client process can actually handle the following signal.
+                            std.posix.kill(nix_process_id, std.posix.SIG.CONT) catch |err|
+                                std.log.err("{s}: failed to send SIGCONT to nix client process in order to propagate signal {d}", .{ @errorName(err), sig });
+
+                            // In this handler, we don't know whether the signal
+                            // was sent to only our own PID or the entire process group.
+                            // It should not hurt to send the signal again
+                            // so let's just propagate it to be sure.
+                            std.posix.kill(nix_process_id, @intCast(sig)) catch |err|
+                                std.log.err("{s}: failed to propagate signal {d} to nix client process", .{ @errorName(err), sig });
+                        }
+                    }
+                }.handler,
+            },
+            .mask = std.posix.empty_sigset,
+            .flags = std.posix.SA.RESETHAND,
+        };
+        try std.posix.sigaction(std.posix.SIG.TERM, &sa, null);
+        try std.posix.sigaction(std.posix.SIG.INT, &sa, null);
     }
 
     const state_dir_path = if (try known_folders.getPath(allocator, .data)) |known_folder_path| state_dir_path: {
@@ -132,10 +169,12 @@ pub fn main() !void {
 
         break :nix_process nix_process;
     };
+    globals.wrapper = nix_process.id;
 
     const process_messages_thread = try std.Thread.spawn(.{}, processMessages, .{ allocator, fifo_path, done_pipe_read, nix_process.id });
 
     const term = try nix_process.wait();
+    globals.wrapper = null;
 
     if (term != .Exited or term.Exited != 0)
         std.log.debug("nix command terminated: {s} {d}", .{ @tagName(term), switch (term) {
@@ -160,7 +199,7 @@ fn processMessages(
     /// The nix command is done when this has data available for reading.
     /// The data itself carries no meaning.
     done: std.fs.File,
-    pid: std.posix.pid_t,
+    pid: std.process.Child.Id,
 ) !void {
     var num_building: u32 = 0;
 
