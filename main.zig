@@ -378,17 +378,26 @@ fn buildHook(allocator: std.mem.Allocator) !void {
         .build_io = build_io,
     } }).send(allocator, fifo, fifo_lock);
 
-    defer (Message{ .done = drv.drv_path }).send(allocator, fifo, fifo_lock) catch |err|
-        std.log.err("{s}: failed to send IPC message", .{@errorName(err)});
+    const build_result = buildHookBuild(allocator, drv.drv_path, build_io.wanted_outputs, store, verbosity);
+    try (Message{ .done = drv.drv_path }).send(allocator, fifo, fifo_lock);
+    try build_result;
+}
 
+fn buildHookBuild(
+    allocator: std.mem.Allocator,
+    drv_path: []const u8,
+    outputs: []const []const u8,
+    store: []const u8,
+    verbosity: nix.log.Action.Verbosity,
+) !void {
     var installable = std.ArrayList(u8).init(allocator);
     defer installable.deinit();
 
-    try installable.appendSlice(drv.drv_path);
+    try installable.appendSlice(drv_path);
     try installable.append('^');
-    for (build_io.wanted_outputs, 0..) |wanted_output, idx| {
+    for (outputs, 0..) |output, idx| {
         if (idx != 0) try installable.append(',');
-        try installable.appendSlice(wanted_output);
+        try installable.appendSlice(output);
     }
 
     std.log.debug("installable: {s}", .{installable.items});
@@ -399,7 +408,7 @@ fn buildHook(allocator: std.mem.Allocator) !void {
             "--no-check-sigs",
             "--from",
             store,
-            drv.drv_path,
+            drv_path,
         });
         defer allocator.free(args);
 
@@ -407,7 +416,7 @@ fn buildHook(allocator: std.mem.Allocator) !void {
 
         const term = try process.spawnAndWait();
         if (term != .Exited or term.Exited != 0) {
-            std.log.err("`nix copy --from {s} {s}` failed: {}", .{ store, drv.drv_path, term });
+            std.log.err("`nix copy --from {s} {s}` failed: {}", .{ store, drv_path, term });
             return error.NixCopy;
         }
     }
