@@ -170,6 +170,7 @@ fn build(
         const result = try std.process.Child.run(.{
             .allocator = allocator,
             .argv = &.{ "nix", "derivation", "show", installable.items },
+            .max_output_bytes = 1024 * 512,
         });
         defer {
             allocator.free(result.stdout);
