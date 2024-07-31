@@ -204,11 +204,10 @@ fn processMessages(
     var num_building: u32 = 0;
 
     std.log.debug("opening FIFO for IPC: {s}", .{fifo_path});
-    const fifo = std.fs.File{
-        .handle = try std.posix.open(fifo_path, .{
-            .NONBLOCK = true, // equivalent to `O_NDELAY`, see `man 2 open`
-        }, 0),
-    };
+    const fifo = try std.fs.openFileAbsolute(fifo_path, .{
+        // Makes sure the `open()` syscall does not block.
+        .mode = .read_write,
+    });
     defer fifo.close();
 
     std.log.debug("waiting for messages from build hooks", .{});
@@ -222,7 +221,7 @@ fn processMessages(
     var fifo_readable_checked_len: usize = 0;
 
     while (try poller.poll()) {
-        {
+        while (true) {
             const fifo_readable = poller.fifo(.fifo).readableSlice(0);
 
             if (std.mem.indexOfScalarPos(u8, fifo_readable, fifo_readable_checked_len, '\n')) |end_pos| {
@@ -256,7 +255,15 @@ fn processMessages(
                     std.log.info("continuing the nix client process", .{});
                     try std.posix.kill(pid, std.posix.SIG.CONT);
                 }
-            } else fifo_readable_checked_len = fifo_readable.len;
+
+                if (end_pos + 1 == fifo_readable.len)
+                    // We have read the buffer to the end
+                    // so we need to poll for new data.
+                    break;
+            } else {
+                fifo_readable_checked_len = fifo_readable.len;
+                break;
+            }
         }
 
         if (poller.fifo(.done).readableLength() != 0) break;
@@ -371,6 +378,9 @@ fn buildHook(allocator: std.mem.Allocator) !void {
         .build_io = build_io,
     } }).send(allocator, fifo, fifo_lock);
 
+    defer (Message{ .done = drv.drv_path }).send(allocator, fifo, fifo_lock) catch |err|
+        std.log.err("{s}: failed to send IPC message", .{@errorName(err)});
+
     var installable = std.ArrayList(u8).init(allocator);
     defer installable.deinit();
 
@@ -402,8 +412,6 @@ fn buildHook(allocator: std.mem.Allocator) !void {
         }
     }
 
-    std.log.debug("`nix copy --from` done", .{});
-
     {
         const args = try nixCli(allocator, verbosity, &.{
             "build",
@@ -421,8 +429,6 @@ fn buildHook(allocator: std.mem.Allocator) !void {
             return error.NixBuild;
         }
     }
-
-    std.log.debug("`nix build` done", .{});
 
     var output_paths = std.BufSet.init(allocator);
     defer output_paths.deinit();
@@ -574,8 +580,6 @@ fn buildHook(allocator: std.mem.Allocator) !void {
             return error.NixCopy;
         }
     }
-
-    try (Message{ .done = drv.drv_path }).send(allocator, fifo, fifo_lock);
 }
 
 fn nixCli(allocator: std.mem.Allocator, verbosity: nix.log.Action.Verbosity, args: []const []const u8) ![]const []const u8 {
