@@ -284,11 +284,11 @@ const Message = union(enum) {
 
         const fifo_writer = fifo.writer();
 
-        if (std.log.defaultLogEnabled(.info)) {
+        if (std.log.defaultLogEnabled(.debug)) {
             const json = try std.json.stringifyAlloc(allocator, self, .{});
             defer allocator.free(json);
 
-            std.log.info("sending IPC message: {s}", .{json});
+            std.log.debug("sending IPC message: {s}", .{json});
 
             try fifo_writer.writeAll(json);
         } else try std.json.stringify(self, .{}, fifo_writer);
