@@ -15,9 +15,9 @@ pub const Event = union(enum) {
     /// the corresponding `start.derivation.drv_path`
     done: []const u8,
 
-    fn emit(self: @This(), allocator: std.mem.Allocator, fifo: std.fs.File, fifo_lock: std.fs.File) !void {
-        try fifo_lock.lock(.exclusive);
-        defer fifo_lock.unlock();
+    fn emit(self: @This(), allocator: std.mem.Allocator, fifo: std.fs.File) !void {
+        try fifo.lock(.exclusive);
+        defer fifo.unlock();
 
         const fifo_writer = fifo.writer();
 
@@ -62,7 +62,7 @@ pub fn main(allocator: std.mem.Allocator) !void {
         std.log.debug("nix config:\n{s}", .{nix_config_msg.items});
     }
 
-    var fifo, var fifo_lock = fifo: {
+    var fifo = fifo: {
         const fifo_path = nix_config.get("builders").?;
         if (fifo_path.len == 0) {
             std.log.err("expected path to FIFO for IPC in nix config entry `builders` but it is empty", .{});
@@ -73,24 +73,12 @@ pub fn main(allocator: std.mem.Allocator) !void {
             return error.AccessDenied;
         }
 
-        const fifo_lock_path = try std.mem.concat(allocator, u8, &.{ fifo_path, ".lock" });
-        defer allocator.free(fifo_lock_path);
-
-        const fifo_lock = try std.fs.openFileAbsolute(fifo_lock_path, .{});
-        errdefer fifo_lock.close();
-
-        const fifo = std.fs.openFileAbsolute(fifo_path, .{ .mode = .write_only }) catch |err| {
+        break :fifo std.fs.openFileAbsolute(fifo_path, .{ .mode = .write_only }) catch |err| {
             std.log.err("{s}: failed to open path to FIFO for IPC: {s}", .{ @errorName(err), fifo_path });
             return err;
         };
-        errdefer fifo.close();
-
-        break :fifo .{ fifo, fifo_lock };
     };
-    defer {
-        fifo.close();
-        fifo_lock.close();
-    }
+    defer fifo.close();
 
     const store = nix_config.get("store").?;
 
@@ -113,10 +101,10 @@ pub fn main(allocator: std.mem.Allocator) !void {
     try (Event{ .start = .{
         .derivation = drv,
         .build_io = build_io,
-    } }).emit(allocator, fifo, fifo_lock);
+    } }).emit(allocator, fifo);
 
     const build_result = build(allocator, drv.drv_path, build_io.wanted_outputs, store, verbosity);
-    try (Event{ .done = drv.drv_path }).emit(allocator, fifo, fifo_lock);
+    try (Event{ .done = drv.drv_path }).emit(allocator, fifo);
     try build_result;
 }
 

@@ -107,16 +107,6 @@ pub fn main() !void {
     };
     defer allocator.free(fifo_path);
 
-    const fifo_lock_path = try std.mem.concat(allocator, u8, &.{ fifo_path, ".lock" });
-    defer allocator.free(fifo_lock_path);
-
-    const fifo_lock = try std.fs.createFileAbsolute(fifo_lock_path, .{ .exclusive = true });
-    defer {
-        fifo_lock.close();
-        std.fs.deleteFileAbsolute(fifo_lock_path) catch |err|
-            std.log.err("{s}: failed to delete lock file: {s}", .{ @errorName(err), fifo_lock_path });
-    }
-
     if (std.os.linux.mknod(fifo_path, std.os.linux.S.IFIFO | 0o622, 0) != 0) return error.Mknod;
     defer std.posix.unlink(fifo_path) catch |err|
         std.log.err("{s}: failed to delete FIFO: {s}", .{ @errorName(err), fifo_path });
