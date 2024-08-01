@@ -130,7 +130,7 @@ pub fn main() !void {
         const build_hook_arg = try std.mem.concat(allocator, u8, &.{
             if (std.fs.path.isAbsolute(args[0])) args[0] else self_exe: {
                 var self_exe_buf: [std.fs.MAX_PATH_BYTES]u8 = undefined;
-                break :self_exe try std.fs.readLinkAbsolute("/proc/self/exe", &self_exe_buf);
+                break :self_exe try std.fs.selfExePath(&self_exe_buf);
             },
             " ",
             hook_arg,
