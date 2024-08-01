@@ -137,18 +137,16 @@ pub fn main() !void {
         });
         defer allocator.free(build_hook_arg);
 
-        const extra_nix_args: []const []const u8 = &.{
-            "--build-hook", build_hook_arg,
-            "--builders",   fifo_path,
-            "--store",      store,
-        };
-
-        const nix_args = try allocator.alloc([]const u8, extra_nix_args.len + args.len);
+        const nix_args = try std.mem.concat(allocator, []const u8, &.{
+            &.{"nix"},
+            &.{
+                "--build-hook", build_hook_arg,
+                "--builders",   fifo_path,
+                "--store",      store,
+            },
+            args[1..],
+        });
         defer allocator.free(nix_args);
-
-        nix_args[0] = "nix";
-        @memcpy(nix_args[1 .. 1 + extra_nix_args.len], extra_nix_args);
-        @memcpy(nix_args[1 + extra_nix_args.len .. 1 + extra_nix_args.len + args.len - 1], args[1..]);
 
         var nix_process = std.process.Child.init(nix_args, allocator);
         nix_process.request_resource_usage_statistics = true;
