@@ -34,7 +34,7 @@ pub fn main() !void {
         var args = try std.process.argsWithAllocator(allocator);
         defer args.deinit();
 
-        std.debug.assert(args.next() != null);
+        std.debug.assert(args.skip());
 
         break :build_hook if (args.next()) |arg1|
             std.mem.eql(u8, arg1, hook_arg)
