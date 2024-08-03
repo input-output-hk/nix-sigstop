@@ -128,12 +128,15 @@ fn build(
     std.log.debug("installable: {s}", .{installable.items});
 
     {
-        const args = try nixCli(allocator, verbosity, &.{
-            "copy",
-            "--no-check-sigs",
-            "--from",
-            store,
-            drv_path,
+        const args = try std.mem.concat(allocator, []const u8, &.{
+            nixCli(verbosity),
+            &.{
+                "copy",
+                "--no-check-sigs",
+                "--from",
+                store,
+                drv_path,
+            },
         });
         defer allocator.free(args);
 
@@ -147,11 +150,14 @@ fn build(
     }
 
     {
-        const args = try nixCli(allocator, verbosity, &.{
-            "build",
-            "--no-link",
-            "--print-build-logs",
-            installable.items,
+        const args = try std.mem.concat(allocator, []const u8, &.{
+            nixCli(verbosity),
+            &.{
+                "build",
+                "--no-link",
+                "--print-build-logs",
+                installable.items,
+            },
         });
         defer allocator.free(args);
 
@@ -271,12 +277,15 @@ fn build(
             }
         }
     } else {
-        const args = try nixCli(allocator, verbosity, &.{
-            "copy",
-            "--no-check-sigs",
-            "--to",
-            store,
-            installable.items,
+        const args = try std.mem.concat(allocator, []const u8, &.{
+            nixCli(verbosity),
+            &.{
+                "copy",
+                "--no-check-sigs",
+                "--to",
+                store,
+                installable.items,
+            },
         });
         defer allocator.free(args);
 
@@ -317,16 +326,18 @@ fn build(
     }
 }
 
-fn nixCli(allocator: std.mem.Allocator, verbosity: nix.log.Action.Verbosity, args: []const []const u8) ![]const []const u8 {
-    var cli = try std.ArrayListUnmanaged([]const u8).initCapacity(allocator, 4 + args.len);
-    errdefer cli.deinit(allocator);
-
-    cli.appendSliceAssumeCapacity(&.{ "nix", "--log-format", "internal-json" });
-    switch (@intFromEnum(verbosity)) {
-        0 => {},
-        inline else => |v| cli.appendAssumeCapacity("-" ++ "v" ** v),
-    }
-    cli.appendSliceAssumeCapacity(args);
-
-    return cli.toOwnedSlice(allocator);
+fn nixCli(verbosity: nix.log.Action.Verbosity) []const []const u8 {
+    const head = .{
+        "nix",
+        "--extra-experimental-features",
+        "nix-command",
+        "--log-format",
+        "internal-json",
+    };
+    return switch (@intFromEnum(verbosity)) {
+        0 => &(head ++ .{"--quiet"} ** 2),
+        1 => &(head ++ .{"--quiet"}),
+        2 => &head,
+        inline else => |v| &(head ++ .{"-" ++ "v" ** (v - 2)}),
+    };
 }
