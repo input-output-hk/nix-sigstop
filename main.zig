@@ -87,16 +87,16 @@ pub fn main() !void {
     };
     defer allocator.free(state_dir_path);
 
-    try std.fs.cwd().makePath(state_dir_path);
-
-    const store = if (try known_folders.getPath(allocator, .cache)) |known_folder_path| store: {
+    const cache_dir_path = if (try known_folders.getPath(allocator, .cache)) |known_folder_path| cache_dir_path: {
         defer allocator.free(known_folder_path);
-        break :store try std.fs.path.join(allocator, &.{ known_folder_path, "nix-sigstop" });
+        break :cache_dir_path try std.fs.path.join(allocator, &.{ known_folder_path, "nix-sigstop" });
     } else {
         std.log.err("no cache folder available", .{});
         return error.NoCacheDir;
     };
-    defer allocator.free(store);
+    defer allocator.free(cache_dir_path);
+
+    try std.fs.cwd().makePath(state_dir_path);
 
     const fifo_path = fifo_path: {
         // see `PID_MAX_LIMIT` in `man 5 proc`
@@ -137,12 +137,14 @@ pub fn main() !void {
         });
         defer allocator.free(build_hook_arg);
 
+        const builders_arg = try std.mem.join(allocator, &.{std.fs.path.delimiter}, &.{ fifo_path, cache_dir_path });
+        defer allocator.free(builders_arg);
+
         const nix_args = try std.mem.concat(allocator, []const u8, &.{
             &.{"nix"},
             &.{
                 "--build-hook", build_hook_arg,
-                "--builders",   fifo_path,
-                "--store",      store,
+                "--builders",   builders_arg,
             },
             args[1..],
         });
@@ -222,7 +224,7 @@ fn processEvents(
                 switch (event.value) {
                     .start => |msg| {
                         num_building += 1;
-                        std.log.info("build started: {s}", .{msg.derivation.drv_path});
+                        std.log.info("build started: {s}", .{msg.drv_path});
 
                         if (num_building == 1) {
                             std.log.info("stopping the nix client process", .{});

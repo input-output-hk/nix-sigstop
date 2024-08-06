@@ -3,19 +3,12 @@ const lib = @import("lib");
 
 const nix = lib.nix;
 
-/// Symlink build outputs into the eval store to save disk space.
-/// Only works if the eval store is a chroot store!
-const symlink_ifds_into_eval_store = true;
-
 pub const Event = union(enum) {
-    start: struct {
-        derivation: nix.build_hook.Derivation,
-        build_io: nix.build_hook.BuildIo,
-    },
-    /// the corresponding `start.derivation.drv_path`
+    start: nix.build_hook.Derivation,
+    /// the corresponding `start.drv_path`
     done: []const u8,
 
-    fn emit(self: @This(), allocator: std.mem.Allocator, fifo: std.fs.File) !void {
+    fn emit(self: @This(), allocator: std.mem.Allocator, fifo: std.fs.File) (std.mem.Allocator.Error || std.fs.File.LockError || std.fs.File.WriteError)!void {
         try fifo.lock(.exclusive);
         defer fifo.unlock();
 
@@ -43,6 +36,20 @@ pub fn main(allocator: std.mem.Allocator) !void {
     };
     std.log.debug("log verbosity: {s}", .{@tagName(verbosity)});
 
+    std.log.debug("reading nix config from environment", .{});
+    const nix_config_env = nix_config_env: {
+        var diagnostics: ?nix.ChildProcessDiagnostics = null;
+        defer if (diagnostics) |d| d.deinit(allocator);
+        break :nix_config_env nix.config(allocator, &diagnostics) catch |err| return switch (err) {
+            error.CouldNotReadNixConfig => blk: {
+                std.log.err("could not read nix config: {}, stderr: {s}", .{ diagnostics.?.term, diagnostics.?.stderr });
+                break :blk err;
+            },
+            else => err,
+        };
+    };
+    defer nix_config_env.deinit();
+
     var nix_config, var connection = try nix.build_hook.start(allocator);
     defer nix_config.deinit();
 
@@ -62,8 +69,26 @@ pub fn main(allocator: std.mem.Allocator) !void {
         std.log.debug("nix config:\n{s}", .{nix_config_msg.items});
     }
 
-    var fifo = fifo: {
-        const fifo_path = nix_config.get("builders").?;
+    var fifo, const build_store = fifo: {
+        const builders = nix_config.get("builders").?;
+
+        const fifo_path, const build_store = iter: {
+            var builders_iter = std.mem.splitScalar(u8, builders, std.fs.path.delimiter);
+            defer if (std.debug.runtime_safety) std.debug.assert(builders_iter.next() == null);
+            break :iter .{
+                builders_iter.next() orelse break :iter error.NoBuilders,
+                builders_iter.next() orelse break :iter error.NoBuilders,
+            };
+        } catch |err| switch (err) {
+            error.NoBuilders => {
+                std.log.err(
+                    "expected nix config entry `builders` to have two entries separated by '{c}' but found {s}",
+                    .{ std.fs.path.delimiter, builders },
+                );
+                return err;
+            },
+        };
+
         if (fifo_path.len == 0) {
             std.log.err("expected path to FIFO for IPC in nix config entry `builders` but it is empty", .{});
             return error.NoBuilders;
@@ -73,46 +98,203 @@ pub fn main(allocator: std.mem.Allocator) !void {
             return error.AccessDenied;
         }
 
-        break :fifo std.fs.openFileAbsolute(fifo_path, .{ .mode = .write_only }) catch |err| {
-            std.log.err("{s}: failed to open path to FIFO for IPC: {s}", .{ @errorName(err), fifo_path });
-            return err;
+        if (build_store.len == 0) {
+            std.log.err("expected a store for building locally in nix config entry `builders` but it is empty", .{});
+            return error.NoBuilders;
+        }
+
+        std.log.debug("opening FIFO for IPC", .{});
+        break :fifo .{
+            std.fs.openFileAbsolute(fifo_path, .{ .mode = .write_only }) catch |err| {
+                std.log.err("{s}: failed to open path to FIFO for IPC: {s}", .{ @errorName(err), fifo_path });
+                return err;
+            },
+            try allocator.dupe(u8, build_store),
         };
     };
-    defer fifo.close();
-
-    const store = nix_config.get("store").?;
-
-    // Free all the memory in `nix_config` except the entries we still need.
-    {
-        var iter = nix_config.iterator();
-        iter: while (iter.next()) |entry|
-            inline for (.{"store"}) |key| {
-                if (std.mem.eql(u8, entry.key_ptr.*, key)) continue :iter;
-                nix_config.remove(entry.key_ptr.*);
-            };
+    defer {
+        fifo.close();
+        allocator.free(build_store);
     }
 
-    const drv = try connection.readDerivation(allocator);
+    var hook_process = hook_process: {
+        var args = std.ArrayListUnmanaged([]const u8){};
+        defer args.deinit(allocator);
+
+        try args.appendSlice(allocator, nix_config_env.value.@"build-hook".value);
+        {
+            // Length is arbitrary but should suffice for any verbosity encountered in practice.
+            var verbosity_buf: [3]u8 = undefined;
+            const verbosity_str = verbosity_buf[0..std.fmt.formatIntBuf(&verbosity_buf, @intFromEnum(verbosity), 10, .lower, .{})];
+            try args.append(allocator, verbosity_str);
+        }
+
+        var hook_process = std.process.Child.init(args.items, allocator);
+        hook_process.stdin_behavior = .Pipe;
+        hook_process.stderr_behavior = .Pipe;
+
+        try hook_process.spawn();
+
+        break :hook_process hook_process;
+    };
+    errdefer |err| _ = hook_process.kill() catch |kill_err|
+        std.log.err("{s}: {s}: failed to kill build hook", .{ @errorName(err), @errorName(kill_err) });
+
+    std.log.debug("spawned build hook. PID: {d}", .{hook_process.id});
+
+    var hook_response_pipe_read, var hook_response_pipe_write = hook_response_pipe: {
+        const pipe_read, const pipe_write = try std.posix.pipe();
+        break :hook_response_pipe .{
+            std.fs.File{ .handle = pipe_read },
+            std.fs.File{ .handle = pipe_write },
+        };
+    };
+    defer {
+        hook_response_pipe_read.close();
+        hook_response_pipe_write.close();
+    }
+
+    const hook_stderr_thread = try std.Thread.spawn(.{}, process_hook_stderr, .{
+        hook_process.stderr.?.reader(),
+        hook_response_pipe_write.writer(),
+    });
+    defer hook_stderr_thread.join();
+
+    const hook_stdin_writer = hook_process.stdin.?.writer();
+
+    {
+        {
+            const value = try std.mem.join(allocator, " ", nix_config_env.value.@"build-hook".value);
+            defer allocator.free(value);
+
+            try nix_config.put("build-hook", value);
+        }
+        try nix_config.put("builders", nix_config_env.value.builders.value);
+
+        nix_config.hash_map.lockPointers();
+        defer nix_config.hash_map.unlockPointers();
+
+        std.log.debug("initializing build hook", .{});
+        try (nix.build_hook.Initialization{ .nix_config = nix_config }).write(hook_stdin_writer);
+    }
+
+    const drv, const accepted = accept: while (true) {
+        std.log.debug("reading derivation request", .{});
+        const drv = try connection.readDerivation(allocator);
+        errdefer drv.deinit(allocator);
+
+        std.log.debug("requesting build from build hook: {s}", .{drv.drv_path});
+        try (nix.build_hook.Request{ .derivation = drv }).write(hook_stdin_writer);
+
+        std.log.debug("reading response from build hook", .{});
+        const hook_response = try nix.build_hook.Response.read(allocator, hook_response_pipe_read.reader());
+        defer hook_response.deinit(allocator);
+
+        switch (hook_response) {
+            .postpone, .accept => {
+                std.log.debug("forwarding response from build hook to Nix: {s}", .{@tagName(std.meta.activeTag(hook_response))});
+                try hook_response.write(connection.writer);
+
+                switch (hook_response) {
+                    .postpone => drv.deinit(allocator),
+                    .accept => break :accept .{ drv, true },
+                    .decline, .decline_permanently => unreachable,
+                }
+            },
+            .decline, .decline_permanently => break :accept .{ drv, false },
+        }
+    };
     defer drv.deinit(allocator);
 
-    const build_io = try connection.accept(allocator, "auto");
+    try (Event{ .start = drv }).emit(allocator, fifo);
+
+    const handle_error_union = handle_hook_final_response(
+        allocator,
+        if (accepted) .accepted else .{ .declined = drv },
+        &hook_process,
+        &connection,
+        build_store,
+        nix_config.get("store").?,
+        verbosity,
+    );
+
+    (Event{ .done = drv.drv_path }).emit(allocator, fifo) catch |err| {
+        handle_error_union catch |handle_err|
+            std.log.err("{s}: failed to handle final hook response", .{@errorName(handle_err)});
+
+        // XXX Should be able to just `return err` but it seems that fails peer type resolution.
+        // Could this be a compiler bug? This only happens if we have an `errdefer` with capture
+        // in the enclosing block. In our case this is the `errdefer` that kills `hook_process`.
+        return @as(@typeInfo(@TypeOf(Event.emit)).Fn.return_type.?, err);
+    };
+
+    try handle_error_union;
+}
+
+fn process_hook_stderr(stderr_reader: anytype, protocol_writer: anytype) !void {
+    var log_stream = nix.log.logStream(stderr_reader, protocol_writer);
+    const log_reader = log_stream.reader();
+
+    while (true) {
+        // Capacity is arbitrary but should suffice for any lines encountered in practice.
+        var log_buf = std.BoundedArray(u8, 1024 * 512){};
+
+        // The build hook and logging protocols are line-based.
+        log_reader.streamUntilDelimiter(log_buf.writer(), '\n', log_buf.capacity() + 1) catch |err| switch (err) {
+            error.EndOfStream => break,
+            else => return err,
+        };
+
+        std.debug.getStderrMutex().lock();
+        defer std.debug.getStderrMutex().unlock();
+
+        const stderr_writer = std.io.getStdErr().writer();
+
+        try stderr_writer.writeAll(log_buf.constSlice());
+        try stderr_writer.writeByte('\n');
+    }
+
+    std.log.debug("build hook closed stderr", .{});
+}
+
+fn handle_hook_final_response(
+    allocator: std.mem.Allocator,
+    final_response: union(enum) {
+        accepted,
+        declined: nix.build_hook.Derivation,
+    },
+    hook_process: *std.process.Child,
+    connection: *nix.build_hook.Connection(std.fs.File.Reader, std.fs.File.Writer),
+    build_store: []const u8,
+    store: []const u8,
+    verbosity: nix.log.Action.Verbosity,
+) !void {
+    {
+        std.log.debug("waiting for build hook to exit", .{});
+        const term = try hook_process.wait();
+        if (term != .Exited or term.Exited != 0) {
+            std.log.info("build hook terminated with {}", .{term});
+            return error.NixBuildHook;
+        }
+    }
+
+    const drv = switch (final_response) {
+        .accepted => return,
+        .declined => |drv| drv,
+    };
+
+    const build_io = try connection.accept(allocator, build_store);
     defer build_io.deinit(allocator);
 
-    try (Event{ .start = .{
-        .derivation = drv,
-        .build_io = build_io,
-    } }).emit(allocator, fifo);
-
-    const build_result = build(allocator, drv.drv_path, build_io.wanted_outputs, store, verbosity);
-    try (Event{ .done = drv.drv_path }).emit(allocator, fifo);
-    try build_result;
+    try build(allocator, drv.drv_path, build_io.wanted_outputs, build_store, store, verbosity);
 }
 
 fn build(
     allocator: std.mem.Allocator,
     drv_path: []const u8,
     outputs: []const []const u8,
-    store: []const u8,
+    build_store: []const u8,
+    target_store: []const u8,
     verbosity: nix.log.Action.Verbosity,
 ) !void {
     var installable = std.ArrayList(u8).init(allocator);
@@ -134,7 +316,9 @@ fn build(
                 "copy",
                 "--no-check-sigs",
                 "--from",
-                store,
+                target_store,
+                "--to",
+                build_store,
                 drv_path,
             },
         });
@@ -144,8 +328,8 @@ fn build(
 
         const term = try process.spawnAndWait();
         if (term != .Exited or term.Exited != 0) {
-            std.log.err("`nix copy --from {s} {s}` failed: {}", .{ store, drv_path, term });
-            return error.NixCopy;
+            std.log.err("`nix copy --from {s} --to {s} {s}` failed: {}", .{ target_store, build_store, drv_path, term });
+            return error.NixCopyTo;
         }
     }
 
@@ -156,6 +340,8 @@ fn build(
                 "build",
                 "--no-link",
                 "--print-build-logs",
+                "--store",
+                build_store,
                 installable.items,
             },
         });
@@ -165,7 +351,12 @@ fn build(
 
         const term = try process.spawnAndWait();
         if (term != .Exited or term.Exited != 0) {
-            std.log.err("`nix build {s}` failed: {}", .{ installable.items, term });
+            std.log.err("`nix build --store {s} {s}` failed: {}", .{ build_store, installable.items, term });
+            if (build_store[0] == std.fs.path.sep) std.log.warn(
+                \\{s} looks like a chroot store.
+                \\Please ensure I have read and execute permission on all parent directories.
+                \\See https://github.com/NixOS/nixpkgs/pull/90431 for more information.
+            , .{build_store});
             return error.NixBuild;
         }
     }
@@ -201,90 +392,17 @@ fn build(
                 try output_paths.insert(output.path);
     }
 
-    if (symlink_ifds_into_eval_store) {
-        const dump_argv_head = &.{ "nix-store", "--dump-db" };
-        var dump_argv = dump_argv: {
-            var dump_argv = try std.ArrayList([]const u8).initCapacity(allocator, dump_argv_head.len + output_paths.count());
-            dump_argv.appendSliceAssumeCapacity(dump_argv_head);
-            break :dump_argv dump_argv;
-        };
-        defer dump_argv.deinit();
-
-        {
-            var output_paths_iter = output_paths.iterator();
-            while (output_paths_iter.next()) |output_path| {
-                try dump_argv.append(output_path.*);
-
-                if (std.debug.runtime_safety) std.debug.assert(std.mem.startsWith(
-                    u8,
-                    output_path.*,
-                    std.fs.path.sep_str ++ "nix" ++
-                        std.fs.path.sep_str ++ "store" ++
-                        std.fs.path.sep_str,
-                ));
-
-                const sym_link_path = try std.fs.path.join(allocator, &.{ store, output_path.* });
-                std.log.debug("linking: {s} -> {s}", .{ sym_link_path, output_path.* });
-                defer allocator.free(sym_link_path);
-                try std.fs.symLinkAbsolute(output_path.*, sym_link_path, .{});
-            }
-        }
-
-        std.log.debug("importing outputs into eval store: {s} <- {s}", .{ store, dump_argv.items[dump_argv_head.len..] });
-
-        // XXX cannot pipe between the processes directly due to https://github.com/ziglang/zig/issues/7738
-
-        const dump_result = try std.process.Child.run(.{
-            .allocator = allocator,
-            .argv = dump_argv.items,
-            .max_output_bytes = 1024 * 512,
-        });
-        defer {
-            allocator.free(dump_result.stdout);
-            allocator.free(dump_result.stderr);
-        }
-
-        if (dump_result.term != .Exited or dump_result.term.Exited != 0) {
-            std.log.err("`nix-store --dump-db` failed: {}\nstdout: {s}\nstderr: {s}", .{ dump_result.term, dump_result.stdout, dump_result.stderr });
-            return error.NixStoreDumpDb;
-        }
-
-        {
-            var load_process = std.process.Child.init(&.{ "nix-store", "--load-db", "--store", store }, allocator);
-            load_process.stdin_behavior = .Pipe;
-            load_process.stdout_behavior = .Pipe;
-            load_process.stderr_behavior = .Pipe;
-
-            try load_process.spawn();
-
-            try load_process.stdin.?.writeAll(dump_result.stdout);
-            load_process.stdin.?.close();
-            load_process.stdin = null;
-
-            var load_process_stdout = std.ArrayList(u8).init(allocator);
-            defer load_process_stdout.deinit();
-
-            var load_process_stderr = std.ArrayList(u8).init(allocator);
-            defer load_process_stderr.deinit();
-
-            try load_process.collectOutput(&load_process_stdout, &load_process_stderr, 1024 * 512);
-
-            const load_process_term = try load_process.wait();
-
-            if (load_process_term != .Exited or load_process_term.Exited != 0) {
-                std.log.err("`nix-store --load-db` failed: {}\nstdout: {s}\nstderr: {s}", .{ load_process_term, load_process_stdout.items, load_process_stderr.items });
-                return error.NixStoreLoadDb;
-            }
-        }
-    } else {
+    {
         const args = try std.mem.concat(allocator, []const u8, &.{
             nixCli(verbosity),
             &.{
                 "copy",
                 "--no-check-sigs",
+                "--from",
+                build_store,
                 "--to",
-                store,
-                installable.items,
+                target_store,
+                installable.items, // XXX pass `output_paths` instead as that may be less work for Nix to figure out the actual store paths from the installable
             },
         });
         defer allocator.free(args);
@@ -320,8 +438,8 @@ fn build(
 
         const term = try process.spawnAndWait();
         if (term != .Exited or term.Exited != 0) {
-            std.log.err("`nix copy --to {s} {s}` failed: {}", .{ store, installable.items, term });
-            return error.NixCopy;
+            std.log.err("`nix copy --from {s} --to {s} {s}` failed: {}", .{ build_store, target_store, installable.items, term });
+            return error.NixCopyFrom;
         }
     }
 }
