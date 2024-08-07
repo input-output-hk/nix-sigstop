@@ -178,7 +178,7 @@ pub fn main(allocator: std.mem.Allocator) !void {
         try (nix.build_hook.Initialization{ .nix_config = nix_config }).write(hook_stdin_writer);
     }
 
-    const drv, const accepted = accept: while (true) {
+    const drv, const build_io, const accepted = accept: while (true) {
         std.log.debug("reading derivation request", .{});
         const drv = try connection.readDerivation(allocator);
         errdefer drv.deinit(allocator);
@@ -190,33 +190,63 @@ pub fn main(allocator: std.mem.Allocator) !void {
         const hook_response = try nix.build_hook.Response.read(allocator, hook_response_pipe_read.reader());
         defer hook_response.deinit(allocator);
 
-        switch (hook_response) {
-            .postpone, .accept => {
-                std.log.debug("forwarding response from build hook to Nix: {s}", .{@tagName(std.meta.activeTag(hook_response))});
-                try hook_response.write(connection.writer);
+        std.log.debug("build hook responded with \"{s}\"", .{@tagName(std.meta.activeTag(hook_response))});
 
-                switch (hook_response) {
-                    .postpone => drv.deinit(allocator),
-                    .accept => break :accept .{ drv, true },
-                    .decline, .decline_permanently => unreachable,
-                }
+        switch (hook_response) {
+            .postpone => {
+                try connection.postpone();
+
+                drv.deinit(allocator);
             },
-            .decline, .decline_permanently => break :accept .{ drv, false },
+            .accept => |remote_store| {
+                std.log.debug("building remotely in {s}", .{remote_store});
+
+                const build_io = try connection.accept(allocator, remote_store);
+                errdefer build_io.deinit(allocator);
+
+                try nix.wire.writeStruct(nix.build_hook.BuildIo, hook_stdin_writer, build_io);
+
+                break :accept .{ drv, build_io, true };
+            },
+            .decline, .decline_permanently => {
+                // XXX Cache `decline_permanently` so that we don't have
+                // to ask the build hook for the remaining derivations.
+
+                std.log.debug("building locally in {s}", .{build_store});
+
+                break :accept .{
+                    drv,
+                    try connection.accept(allocator, build_store),
+                    false,
+                };
+            },
         }
     };
-    defer drv.deinit(allocator);
+    defer {
+        drv.deinit(allocator);
+        build_io.deinit(allocator);
+    }
 
     try (Event{ .start = drv }).emit(allocator, fifo);
 
-    const handle_error_union = handle_hook_final_response(
-        allocator,
-        if (accepted) .accepted else .{ .declined = drv },
-        &hook_process,
-        &connection,
-        build_store,
-        nix_config.get("store").?,
-        verbosity,
-    );
+    const handle_error_union = handle_error_union: {
+        std.log.debug("waiting for build hook to exit", .{});
+        if (hook_process.wait()) |term| {
+            if (term != .Exited or term.Exited != 0) {
+                std.log.info("build hook terminated with {}", .{term});
+                break :handle_error_union error.NixBuildHook;
+            }
+        } else |err| break :handle_error_union err;
+
+        if (!accepted) build(
+            allocator,
+            drv.drv_path,
+            build_io.wanted_outputs,
+            build_store,
+            nix_config.get("store").?,
+            verbosity,
+        ) catch |err| break :handle_error_union err;
+    };
 
     (Event{ .done = drv.drv_path }).emit(allocator, fifo) catch |err| {
         handle_error_union catch |handle_err|
@@ -259,39 +289,6 @@ fn process_hook_stderr(stderr_reader: anytype, protocol_writer: anytype) !void {
     }
 
     std.log.debug("build hook closed stderr", .{});
-}
-
-fn handle_hook_final_response(
-    allocator: std.mem.Allocator,
-    final_response: union(enum) {
-        accepted,
-        declined: nix.build_hook.Derivation,
-    },
-    hook_process: *std.process.Child,
-    connection: *nix.build_hook.Connection(std.fs.File.Reader, std.fs.File.Writer),
-    build_store: []const u8,
-    store: []const u8,
-    verbosity: nix.log.Action.Verbosity,
-) !void {
-    {
-        std.log.debug("waiting for build hook to exit", .{});
-        const term = try hook_process.wait();
-        if (term != .Exited or term.Exited != 0) {
-            std.log.info("build hook terminated with {}", .{term});
-            return error.NixBuildHook;
-        }
-    }
-
-    const drv = switch (final_response) {
-        .accepted => return,
-        .declined => |drv| drv,
-    };
-
-    std.log.debug("accepting build request for {s}", .{drv.drv_path});
-    const build_io = try connection.accept(allocator, build_store);
-    defer build_io.deinit(allocator);
-
-    try build(allocator, drv.drv_path, build_io.wanted_outputs, build_store, store, verbosity);
 }
 
 fn build(
