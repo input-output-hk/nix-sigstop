@@ -239,11 +239,15 @@ fn process_hook_stderr(stderr_reader: anytype, protocol_writer: anytype) !void {
         // Capacity is arbitrary but should suffice for any lines encountered in practice.
         var log_buf = std.BoundedArray(u8, 1024 * 512){};
 
+        std.log.debug("waiting for a log line from the build hook", .{});
+
         // The build hook and logging protocols are line-based.
         log_reader.streamUntilDelimiter(log_buf.writer(), '\n', log_buf.capacity() + 1) catch |err| switch (err) {
             error.EndOfStream => break,
             else => return err,
         };
+
+        std.log.debug("forwarding a log line of {d} bytes from the build hook", .{log_buf.len});
 
         std.debug.getStderrMutex().lock();
         defer std.debug.getStderrMutex().unlock();
@@ -283,6 +287,7 @@ fn handle_hook_final_response(
         .declined => |drv| drv,
     };
 
+    std.log.debug("accepting build request for {s}", .{drv.drv_path});
     const build_io = try connection.accept(allocator, build_store);
     defer build_io.deinit(allocator);
 
@@ -307,51 +312,51 @@ fn build(
         try installable.appendSlice(output);
     }
 
-    std.log.debug("installable: {s}", .{installable.items});
+    std.log.info("building {s}", .{installable.items});
 
     {
-        const args = try std.mem.concat(allocator, []const u8, &.{
-            nixCli(verbosity),
-            &.{
-                "copy",
-                "--no-check-sigs",
-                "--from",
-                target_store,
-                "--to",
-                build_store,
-                drv_path,
-            },
-        });
+        const cli = &.{
+            "copy",
+            "--no-check-sigs",
+            "--from",
+            target_store,
+            "--to",
+            build_store,
+            drv_path,
+        };
+
+        const args = try std.mem.concat(allocator, []const u8, &.{ nixCli(verbosity), cli });
         defer allocator.free(args);
 
         var process = std.process.Child.init(args, allocator);
 
+        std.log.debug("running `nix {s}`", .{lib.fmt.join(" ", cli)});
         const term = try process.spawnAndWait();
         if (term != .Exited or term.Exited != 0) {
-            std.log.err("`nix copy --from {s} --to {s} {s}` failed: {}", .{ target_store, build_store, drv_path, term });
+            std.log.err("`nix {s}` failed: {}", .{ lib.fmt.join(" ", cli), term });
             return error.NixCopyTo;
         }
     }
 
     {
-        const args = try std.mem.concat(allocator, []const u8, &.{
-            nixCli(verbosity),
-            &.{
-                "build",
-                "--no-link",
-                "--print-build-logs",
-                "--store",
-                build_store,
-                installable.items,
-            },
-        });
+        const cli = &.{
+            "build",
+            "--no-link",
+            "--print-build-logs",
+            "--store",
+            build_store,
+            installable.items,
+        };
+
+        const args = try std.mem.concat(allocator, []const u8, &.{ nixCli(verbosity), cli });
         defer allocator.free(args);
 
         var process = std.process.Child.init(args, allocator);
 
+        std.log.debug("running `nix {s}`", .{lib.fmt.join(" ", cli)});
         const term = try process.spawnAndWait();
         if (term != .Exited or term.Exited != 0) {
-            std.log.err("`nix build --store {s} {s}` failed: {}", .{ build_store, installable.items, term });
+            std.log.err("`nix {s}` failed: {}", .{ lib.fmt.join(" ", cli), term });
             if (build_store[0] == std.fs.path.sep) std.log.warn(
                 \\{s} looks like a chroot store.
                 \\Please ensure I have read and execute permission on all parent directories.
@@ -364,9 +369,12 @@ fn build(
     var output_paths = std.BufSet.init(allocator);
     defer output_paths.deinit();
     {
+        const args = &.{ "nix", "derivation", "show", installable.items };
+
+        std.log.debug("running `{s}`", .{lib.fmt.join(" ", args)});
         const result = try std.process.Child.run(.{
             .allocator = allocator,
-            .argv = &.{ "nix", "derivation", "show", installable.items },
+            .argv = args,
             .max_output_bytes = 1024 * 512,
         });
         defer {
@@ -375,14 +383,14 @@ fn build(
         }
 
         if (result.term != .Exited or result.term.Exited != 0) {
-            std.log.err("`nix derivation show {s}` failed: {}\nstdout: {s}\nstderr: {s}", .{ installable.items, result.term, result.stdout, result.stderr });
+            std.log.err("`{s}` failed: {}\nstdout: {s}\nstderr: {s}", .{ lib.fmt.join(" ", args), result.term, result.stdout, result.stderr });
             return error.NixDerivationShow;
         }
 
         const parsed = std.json.parseFromSlice(std.json.ArrayHashMap(struct {
             outputs: std.json.ArrayHashMap(struct { path: []const u8 }),
         }), allocator, result.stdout, .{ .ignore_unknown_fields = true }) catch |err| {
-            std.log.err("{s}: Failed to parse output of `nix derivation show {s}`\nstdout: {s}\nstderr: {s}", .{ @errorName(err), installable.items, result.stdout, result.stderr });
+            std.log.err("{s}: failed to parse output of `{s}`\nstdout: {s}\nstderr: {s}", .{ @errorName(err), lib.fmt.join(" ", args), result.stdout, result.stderr });
             return err;
         };
         defer parsed.deinit();
@@ -393,18 +401,17 @@ fn build(
     }
 
     {
-        const args = try std.mem.concat(allocator, []const u8, &.{
-            nixCli(verbosity),
-            &.{
-                "copy",
-                "--no-check-sigs",
-                "--from",
-                build_store,
-                "--to",
-                target_store,
-                installable.items, // XXX pass `output_paths` instead as that may be less work for Nix to figure out the actual store paths from the installable
-            },
-        });
+        const cli = &.{
+            "copy",
+            "--no-check-sigs",
+            "--from",
+            build_store,
+            "--to",
+            target_store,
+            installable.items, // XXX pass `output_paths` instead as that may be less work for Nix to figure out the actual store paths from the installable
+        };
+
+        const args = try std.mem.concat(allocator, []const u8, &.{ nixCli(verbosity), cli });
         defer allocator.free(args);
 
         var process = std.process.Child.init(args, allocator);
@@ -436,9 +443,10 @@ fn build(
             try env.putMove(key, try value.toOwnedSlice());
         }
 
+        std.log.debug("running `nix {s}`", .{lib.fmt.join(" ", cli)});
         const term = try process.spawnAndWait();
         if (term != .Exited or term.Exited != 0) {
-            std.log.err("`nix copy --from {s} --to {s} {s}` failed: {}", .{ build_store, target_store, installable.items, term });
+            std.log.err("`nix {s}` failed: {}", .{ lib.fmt.join(" ", cli), term });
             return error.NixCopyFrom;
         }
     }
