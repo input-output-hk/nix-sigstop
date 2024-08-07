@@ -416,11 +416,13 @@ fn build(
 
         var process = std.process.Child.init(args, allocator);
 
+        const key_nix_held_locks = "NIX_HELD_LOCKS";
+
         var env = try std.process.getEnvMap(allocator);
         defer env.deinit();
         process.env_map = &env;
         {
-            const key = try allocator.dupe(u8, "NIX_HELD_LOCKS");
+            const key = try allocator.dupe(u8, key_nix_held_locks);
             errdefer allocator.free(key);
 
             var value = std.ArrayList(u8).init(allocator);
@@ -438,15 +440,16 @@ fn build(
                 }
             }
 
-            std.log.debug("NIX_HELD_LOCKS={s}", .{value.items});
-
             try env.putMove(key, try value.toOwnedSlice());
         }
 
-        std.log.debug("running `nix {s}`", .{lib.fmt.join(" ", cli)});
+        const format = "`{s}={s} nix {s}`";
+        const format_args = .{ key_nix_held_locks, env.get(key_nix_held_locks).?, lib.fmt.join(" ", cli) };
+
+        std.log.debug("running " ++ format, format_args);
         const term = try process.spawnAndWait();
         if (term != .Exited or term.Exited != 0) {
-            std.log.err("`nix {s}` failed: {}", .{ lib.fmt.join(" ", cli), term });
+            std.log.err(format ++ " failed: {}", format_args ++ .{term});
             return error.NixCopyFrom;
         }
     }
