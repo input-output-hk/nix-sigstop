@@ -1,3 +1,4 @@
+const builtin = @import("builtin");
 const std = @import("std");
 const lib = @import("lib");
 
@@ -27,7 +28,7 @@ pub const Event = union(enum) {
     }
 };
 
-pub fn main(allocator: std.mem.Allocator) !void {
+pub fn main(allocator: std.mem.Allocator, nix_config_env: nix.Config) !void {
     const verbosity = verbosity: {
         var args = try std.process.argsWithAllocator(allocator);
         defer args.deinit();
@@ -35,20 +36,6 @@ pub fn main(allocator: std.mem.Allocator) !void {
         break :verbosity try nix.build_hook.parseArgs(&args);
     };
     std.log.debug("log verbosity: {s}", .{@tagName(verbosity)});
-
-    std.log.debug("reading nix config from environment", .{});
-    const nix_config_env = nix_config_env: {
-        var diagnostics: ?nix.ChildProcessDiagnostics = null;
-        defer if (diagnostics) |d| d.deinit(allocator);
-        break :nix_config_env nix.config(allocator, &diagnostics) catch |err| return switch (err) {
-            error.CouldNotReadNixConfig => blk: {
-                std.log.err("could not read nix config: {}, stderr: {s}", .{ diagnostics.?.term, diagnostics.?.stderr });
-                break :blk err;
-            },
-            else => err,
-        };
-    };
-    defer nix_config_env.deinit();
 
     var nix_config, var connection = try nix.build_hook.start(allocator);
     defer nix_config.deinit();
@@ -69,13 +56,14 @@ pub fn main(allocator: std.mem.Allocator) !void {
         std.log.debug("nix config:\n{s}", .{nix_config_msg.items});
     }
 
-    var fifo, const build_store = fifo: {
+    var fifo, const build_store, const target_store = builders: {
         const builders = nix_config.get("builders").?;
 
-        const fifo_path, const build_store = iter: {
+        const fifo_path, const build_store, const target_store = iter: {
             var builders_iter = std.mem.splitScalar(u8, builders, std.fs.path.delimiter);
             defer if (std.debug.runtime_safety) std.debug.assert(builders_iter.next() == null);
             break :iter .{
+                builders_iter.next() orelse break :iter error.NoBuilders,
                 builders_iter.next() orelse break :iter error.NoBuilders,
                 builders_iter.next() orelse break :iter error.NoBuilders,
             };
@@ -104,24 +92,26 @@ pub fn main(allocator: std.mem.Allocator) !void {
         }
 
         std.log.debug("opening FIFO for IPC", .{});
-        break :fifo .{
+        break :builders .{
             std.fs.openFileAbsolute(fifo_path, .{ .mode = .write_only }) catch |err| {
                 std.log.err("{s}: failed to open path to FIFO for IPC: {s}", .{ @errorName(err), fifo_path });
                 return err;
             },
             try allocator.dupe(u8, build_store),
+            try allocator.dupe(u8, target_store),
         };
     };
     defer {
         fifo.close();
         allocator.free(build_store);
+        allocator.free(target_store);
     }
 
     var hook_process = hook_process: {
         var args = std.ArrayListUnmanaged([]const u8){};
         defer args.deinit(allocator);
 
-        try args.appendSlice(allocator, nix_config_env.value.@"build-hook".value);
+        try args.appendSlice(allocator, nix_config_env.@"build-hook".value);
         {
             // Length is arbitrary but should suffice for any verbosity encountered in practice.
             var verbosity_buf: [3]u8 = undefined;
@@ -164,12 +154,12 @@ pub fn main(allocator: std.mem.Allocator) !void {
 
     {
         {
-            const value = try std.mem.join(allocator, " ", nix_config_env.value.@"build-hook".value);
+            const value = try std.mem.join(allocator, " ", nix_config_env.@"build-hook".value);
             defer allocator.free(value);
 
             try nix_config.put("build-hook", value);
         }
-        try nix_config.put("builders", nix_config_env.value.builders.value);
+        try nix_config.put("builders", nix_config_env.builders.value);
 
         nix_config.hash_map.lockPointers();
         defer nix_config.hash_map.unlockPointers();
@@ -398,13 +388,22 @@ fn build(
     }
 
     {
+        // `NIX_HELD_LOCKS` only has an effect on the `nix copy` command with local fs stores.
+        const local_target_store = if (isLocalStore(target_store)) null else try daemonStoreAsLocalStore(allocator, target_store);
+        defer if (local_target_store) |lts| allocator.free(lts);
+
+        if (local_target_store) |lts| std.log.info(
+            "assuming store `{s}` to effectively be the same as current store `{s}` so that we can copy {s} into it",
+            .{ lts, target_store, installable.items },
+        );
+
         const cli = &.{
             "copy",
             "--no-check-sigs",
             "--from",
             build_store,
             "--to",
-            target_store,
+            local_target_store orelse target_store,
             installable.items, // XXX pass `output_paths` instead as that may be less work for Nix to figure out the actual store paths from the installable
         };
 
@@ -466,4 +465,87 @@ fn nixCli(verbosity: nix.log.Action.Verbosity) []const []const u8 {
         2 => &head,
         inline else => |v| &(head ++ .{"-" ++ "v" ** (v - 2)}),
     };
+}
+
+/// Returns an equivalent local fs store for the given local daemon store if possible.
+// TODO only Dir.AccessError subset
+fn daemonStoreAsLocalStore(allocator: std.mem.Allocator, daemon_store: []const u8) (std.mem.Allocator.Error || std.fs.Dir.AccessError)!?[]const u8 {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const arena_allocator = arena.allocator();
+
+    const state, const store = local: {
+        const uri = std.Uri.parse(daemon_store) catch |err| switch (err) {
+            error.UnexpectedCharacter, error.InvalidFormat => std.Uri.parseAfterScheme("", daemon_store) catch return null,
+            error.InvalidPort => return null,
+        };
+
+        if (uri.host != null) return null;
+
+        const path = try uri.path.toRawMaybeAlloc(arena_allocator);
+
+        if (!(std.mem.eql(u8, uri.scheme, "unix") and path.len != 0 or
+            std.mem.eql(u8, uri.scheme, "") and std.mem.eql(u8, path, "daemon")))
+            return null;
+
+        const uri_query: ?[]const u8 = if (uri.query) |query|
+            try query.toRawMaybeAlloc(arena_allocator)
+        else
+            null;
+
+        var state: []const u8 = "/nix/var/nix";
+        var root: []const u8 = "/";
+
+        if (uri_query) |query| {
+            var uri_query_iter = std.mem.tokenizeScalar(u8, query, '&');
+            while (uri_query_iter.next()) |param| {
+                var param_iter = std.mem.splitScalar(u8, param, '=');
+
+                const param_name = param_iter.next() orelse return null;
+                const param_value = param_iter.next();
+
+                if (std.mem.eql(u8, param_name, "state"))
+                    state = param_value orelse return null
+                else if (std.mem.eql(u8, param_name, "root"))
+                    root = param_value orelse return null
+                else
+                    continue;
+
+                if (param_iter.next() != null) return null;
+            }
+        }
+
+        break :local .{
+            try std.fs.path.join(arena_allocator, &.{ root, state }),
+            if (uri_query) |query| try std.mem.concat(arena_allocator, u8, &.{ "local?", query }) else "local",
+        };
+    };
+
+    // According to `nix help-stores`, `auto` only checks the state directory for write permission.
+    if (!builtin.is_test) std.fs.accessAbsolute(state, .{ .mode = .write_only }) catch |err| return switch (err) {
+        error.PermissionDenied, error.FileNotFound => null,
+        else => err,
+    };
+
+    return try allocator.dupe(u8, store);
+}
+
+test daemonStoreAsLocalStore {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    try std.testing.expectEqual(null, daemonStoreAsLocalStore(allocator, "dummy"));
+    try std.testing.expectEqual(null, daemonStoreAsLocalStore(allocator, "local"));
+    try std.testing.expectEqualStrings("local", (try daemonStoreAsLocalStore(allocator, "daemon")).?);
+    try std.testing.expectEqualStrings("local", (try daemonStoreAsLocalStore(allocator, "unix:///nix/var/nix/daemon-socket/socket")).?);
+    try std.testing.expectEqualStrings("local?root=", (try daemonStoreAsLocalStore(allocator, "daemon?root=")).?);
+    try std.testing.expectEqualStrings("local?root=", (try daemonStoreAsLocalStore(allocator, "unix:///nix/var/nix/daemon-socket/socket?root=")).?);
+    try std.testing.expectEqualStrings("local?root=/", (try daemonStoreAsLocalStore(allocator, "daemon?root=/")).?);
+}
+
+fn isLocalStore(store: []const u8) bool {
+    return std.mem.startsWith(u8, store, "/") or
+        std.mem.eql(u8, store, "local") or
+        std.mem.startsWith(u8, store, "local?");
 }
