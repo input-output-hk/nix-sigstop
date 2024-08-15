@@ -25,7 +25,7 @@ var globals: union(enum) {
     build_hook,
 } = .{ .wrapper = null };
 
-pub fn main() !void {
+pub fn main() !u8 {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer if (gpa.deinit() == .leak) std.log.err("leaked memory", .{});
     const allocator = gpa.allocator();
@@ -237,6 +237,11 @@ pub fn main() !void {
             @as(f32, @floatFromInt(max_rss)) / 1024 / 1024,
             @as(f32, @floatFromInt(max_rss)) / 1024 / 1024 / 1024,
         });
+
+    return switch (term) {
+        .Exited => |status| status,
+        else => 1,
+    };
 }
 
 fn processEvents(

@@ -28,7 +28,7 @@ pub const Event = union(enum) {
     }
 };
 
-pub fn main(allocator: std.mem.Allocator, nix_config_env: nix.Config) !void {
+pub fn main(allocator: std.mem.Allocator, nix_config_env: nix.Config) !u8 {
     const verbosity = verbosity: {
         var args = try std.process.argsWithAllocator(allocator);
         defer args.deinit();
@@ -219,14 +219,17 @@ pub fn main(allocator: std.mem.Allocator, nix_config_env: nix.Config) !void {
 
     try (Event{ .start = drv }).emit(allocator, fifo);
 
-    const handle_error_union = handle_error_union: {
+    const status = status: {
         std.log.debug("waiting for build hook to exit", .{});
         if (hook_process.wait()) |term| {
             if (term != .Exited or term.Exited != 0) {
                 std.log.info("build hook terminated with {}", .{term});
-                break :handle_error_union error.NixBuildHook;
+                break :status switch (term) {
+                    .Exited => |code| code,
+                    else => 1,
+                };
             }
-        } else |err| break :handle_error_union err;
+        } else |err| break :status err;
 
         if (!accepted) build(
             allocator,
@@ -235,20 +238,22 @@ pub fn main(allocator: std.mem.Allocator, nix_config_env: nix.Config) !void {
             build_store,
             nix_config.get("store").?,
             verbosity,
-        ) catch |err| break :handle_error_union err;
+        ) catch |err| break :status err;
+
+        break :status 0;
     };
 
     (Event{ .done = drv.drv_path }).emit(allocator, fifo) catch |err| {
-        handle_error_union catch |handle_err|
-            std.log.err("{s}: failed to handle final hook response", .{@errorName(handle_err)});
+        _ = status catch |status_err|
+            std.log.err("{s}: failed to handle final hook response", .{@errorName(status_err)});
 
         // XXX Should be able to just `return err` but it seems that fails peer type resolution.
         // Could this be a compiler bug? This only happens if we have an `errdefer` with capture
         // in the enclosing block. In our case this is the `errdefer` that kills `hook_process`.
-        return @as(@typeInfo(@TypeOf(Event.emit)).Fn.return_type.?, err);
+        return @as(lib.meta.FnErrorSet(@TypeOf(Event.emit))!u8, err);
     };
 
-    try handle_error_union;
+    return status;
 }
 
 fn process_hook_stderr(stderr_reader: anytype, protocol_writer: anytype) !void {
