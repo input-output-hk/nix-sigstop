@@ -385,7 +385,7 @@ fn proxyDaemonSocket(
 
             wg.spawnManager(struct {
                 fn call(args: anytype) void {
-                    const reason = @call(.auto, lib.io.proxyDuplexPosix, args) catch |err| {
+                    const reason = @call(.auto, lib.posix.proxyDuplex, args) catch |err| {
                         std.log.err("{s}: error proxying nix client connection", .{@errorName(err)});
                         return;
                     };
