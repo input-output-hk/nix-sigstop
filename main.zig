@@ -149,8 +149,25 @@ pub fn main() !u8 {
             std.log.err("{s}: failed to delete daemon socket: {s}", .{ @errorName(err), daemon_socket_path });
     }
 
-    // TODO discover from `nix_config_env` and `--store`
-    const upstream_daemon_socket_path = "/nix/var/nix/daemon-socket/socket";
+    const upstream_daemon_socket_path = upstream_daemon_socket_path: {
+        // `nix store info` resolves `--store auto`.
+        var diagnostics: ?nix.ChildProcessDiagnostics = null;
+        defer if (diagnostics) |d| d.deinit(allocator);
+        const store_info = try nix.storeInfo(allocator, nix_config_env.value.store.value, &diagnostics);
+        defer store_info.deinit();
+
+        const store = store_info.value.url;
+
+        break :upstream_daemon_socket_path if (std.mem.eql(u8, store, "daemon") or std.mem.startsWith(u8, store, "daemon?"))
+            "/nix/var/nix/daemon-socket/socket"
+        else if (std.mem.startsWith(u8, store, "unix://"))
+            store["unix://".len .. std.mem.indexOfScalar(u8, store, '?') orelse store.len]
+        else {
+            std.log.err("nix-sigstop only works with local daemon stores which the current store is not: {s}", .{store});
+            return 1;
+        };
+    };
+    std.log.debug("upstream nix daemon socket: {s}", .{upstream_daemon_socket_path});
 
     var process_events_thread: ?std.Thread = null;
 
