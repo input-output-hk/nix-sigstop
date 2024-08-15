@@ -468,8 +468,10 @@ fn nixCli(verbosity: nix.log.Action.Verbosity) []const []const u8 {
 }
 
 /// Returns an equivalent local fs store for the given local daemon store if possible.
-// TODO only Dir.AccessError subset
-fn daemonStoreAsLocalStore(allocator: std.mem.Allocator, daemon_store: []const u8) (std.mem.Allocator.Error || std.fs.Dir.AccessError)!?[]const u8 {
+fn daemonStoreAsLocalStore(allocator: std.mem.Allocator, daemon_store: []const u8) (std.mem.Allocator.Error || lib.meta.ErrorSetExcluding(
+    std.fs.Dir.AccessError,
+    &.{ error.PermissionDenied, error.FileNotFound },
+))!?[]const u8 {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const arena_allocator = arena.allocator();
@@ -524,7 +526,7 @@ fn daemonStoreAsLocalStore(allocator: std.mem.Allocator, daemon_store: []const u
     // According to `nix help-stores`, `auto` only checks the state directory for write permission.
     if (!builtin.is_test) std.fs.accessAbsolute(state, .{ .mode = .write_only }) catch |err| return switch (err) {
         error.PermissionDenied, error.FileNotFound => null,
-        else => err,
+        else => |e| e,
     };
 
     return try allocator.dupe(u8, store);
