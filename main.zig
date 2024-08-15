@@ -44,15 +44,15 @@ pub fn main() !u8 {
 
     std.log.debug("reading nix config from environment", .{});
     const nix_config_env = nix_config_env: {
-        var diagnostics: ?nix.ChildProcessDiagnostics = null;
-        defer if (diagnostics) |d| d.deinit(allocator);
-        break :nix_config_env nix.config(allocator, &diagnostics) catch |err| return switch (err) {
-            error.CouldNotReadNixConfig => blk: {
-                std.log.err("could not read nix config: {}, stderr: {s}", .{ diagnostics.?.term, diagnostics.?.stderr });
-                break :blk err;
+        var diagnostics: nix.ChildProcessDiagnostics = undefined;
+        errdefer |err| switch (err) {
+            error.CouldNotReadNixConfig => {
+                defer diagnostics.deinit(allocator);
+                std.log.err("could not read nix config: {}, stderr: {s}", .{ diagnostics.term, diagnostics.stderr });
             },
-            else => err,
+            else => {},
         };
+        break :nix_config_env try nix.config(allocator, &diagnostics);
     };
     defer nix_config_env.deinit();
 
@@ -151,9 +151,17 @@ pub fn main() !u8 {
 
     const upstream_daemon_socket_path = upstream_daemon_socket_path: {
         // `nix store info` resolves `--store auto`.
-        var diagnostics: ?nix.ChildProcessDiagnostics = null;
-        defer if (diagnostics) |d| d.deinit(allocator);
-        const store_info = try nix.storeInfo(allocator, nix_config_env.value.store.value, &diagnostics);
+        const store_info = store_info: {
+            var diagnostics: nix.ChildProcessDiagnostics = undefined;
+            errdefer |err| {
+                defer diagnostics.deinit(allocator);
+                std.log.err(
+                    "{s}: `nix store info --store {s}` terminated with {}\nstderr: {s}",
+                    .{ @errorName(err), nix_config_env.value.store.value, diagnostics.term, diagnostics.stderr },
+                );
+            }
+            break :store_info try nix.storeInfo(allocator, nix_config_env.value.store.value, &diagnostics);
+        };
         defer store_info.deinit();
 
         const store = store_info.value.url;
