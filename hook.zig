@@ -326,10 +326,10 @@ fn build(
 
         var process = std.process.Child.init(args, allocator);
 
-        log.debug("running `nix {s}`", .{lib.fmt.join(" ", cli)});
+        log.debug("running `nix {s}`", .{lib.fmt.fmtJoin(" ", cli)});
         const term = try process.spawnAndWait();
         if (term != .Exited or term.Exited != 0) {
-            log.err("`nix {s}` failed: {}", .{ lib.fmt.join(" ", cli), term });
+            log.err("`nix {s}` failed: {}", .{ lib.fmt.fmtJoin(" ", cli), term });
             return error.NixCopyTo;
         }
     }
@@ -349,10 +349,10 @@ fn build(
 
         var process = std.process.Child.init(args, allocator);
 
-        log.debug("running `nix {s}`", .{lib.fmt.join(" ", cli)});
+        log.debug("running `nix {s}`", .{lib.fmt.fmtJoin(" ", cli)});
         const term = try process.spawnAndWait();
         if (term != .Exited or term.Exited != 0) {
-            log.err("`nix {s}` failed: {}", .{ lib.fmt.join(" ", cli), term });
+            log.err("`nix {s}` failed: {}", .{ lib.fmt.fmtJoin(" ", cli), term });
             if (build_store[0] == std.fs.path.sep) log.warn(
                 \\{s} looks like a chroot store.
                 \\Please ensure I have read and execute permission on all parent directories.
@@ -367,7 +367,7 @@ fn build(
     {
         const args = &.{ "nix", "derivation", "show", installable.items };
 
-        log.debug("running `{s}`", .{lib.fmt.join(" ", args)});
+        log.debug("running `{s}`", .{lib.fmt.fmtJoin(" ", args)});
         const result = try std.process.Child.run(.{
             .allocator = allocator,
             .argv = args,
@@ -379,14 +379,14 @@ fn build(
         }
 
         if (result.term != .Exited or result.term.Exited != 0) {
-            log.err("`{s}` failed: {}\nstdout: {s}\nstderr: {s}", .{ lib.fmt.join(" ", args), result.term, result.stdout, result.stderr });
+            log.err("`{s}` failed: {}\nstdout: {s}\nstderr: {s}", .{ lib.fmt.fmtJoin(" ", args), result.term, result.stdout, result.stderr });
             return error.NixDerivationShow;
         }
 
         const parsed = std.json.parseFromSlice(std.json.ArrayHashMap(struct {
             outputs: std.json.ArrayHashMap(struct { path: []const u8 }),
         }), allocator, result.stdout, .{ .ignore_unknown_fields = true }) catch |err| {
-            log.err("{s}: failed to parse output of `{s}`\nstdout: {s}\nstderr: {s}", .{ @errorName(err), lib.fmt.join(" ", args), result.stdout, result.stderr });
+            log.err("{s}: failed to parse output of `{s}`\nstdout: {s}\nstderr: {s}", .{ @errorName(err), lib.fmt.fmtJoin(" ", args), result.stdout, result.stderr });
             return err;
         };
         defer parsed.deinit();
@@ -449,7 +449,7 @@ fn build(
         }
 
         const format = "`{s}={s} nix {s}`";
-        const format_args = .{ key_nix_held_locks, env.get(key_nix_held_locks).?, lib.fmt.join(" ", cli) };
+        const format_args = .{ key_nix_held_locks, env.get(key_nix_held_locks).?, lib.fmt.fmtJoin(" ", cli) };
 
         log.debug("running " ++ format, format_args);
         const term = try process.spawnAndWait();
