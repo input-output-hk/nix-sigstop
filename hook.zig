@@ -148,6 +148,8 @@ pub fn main(allocator: std.mem.Allocator, nix_config_env: nix.Config) !u8 {
         hook_process.stderr.?.reader(),
         hook_response_pipe_write.writer(),
     });
+    hook_stderr_thread.setName(lib.mem.capConst(u8, "hook stderr", std.Thread.max_name_len, .end)) catch |err|
+        std.log.debug("{s}: failed to set thread name", .{@errorName(err)});
     defer hook_stderr_thread.join();
 
     const hook_stdin_writer = hook_process.stdin.?.writer();

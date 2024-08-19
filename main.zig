@@ -199,6 +199,8 @@ pub fn main() !u8 {
     }
 
     proxy_daemon_socket_thread = try std.Thread.spawn(.{}, proxyDaemonSocket, .{ allocator, &daemon_server, upstream_daemon_socket_path, done_pipe_read });
+    proxy_daemon_socket_thread.?.setName(lib.mem.capConst(u8, "daemon proxy", std.Thread.max_name_len, .end)) catch |err|
+        std.log.debug("{s}: failed to set thread name", .{@errorName(err)});
 
     var nix_process = nix_process: {
         const args = try std.process.argsAlloc(allocator);
@@ -247,6 +249,8 @@ pub fn main() !u8 {
     globals.wrapper = nix_process.id;
 
     process_events_thread = try std.Thread.spawn(.{}, processEvents, .{ allocator, fifo_path, done_pipe_read, nix_process.id });
+    process_events_thread.?.setName(lib.mem.capConst(u8, "hook events", std.Thread.max_name_len, .end)) catch |err|
+        std.log.debug("{s}: failed to set thread name", .{@errorName(err)});
 
     const term = try nix_process.wait();
     globals.wrapper = null;
