@@ -109,6 +109,15 @@ pub fn main(allocator: std.mem.Allocator, nix_config_env: nix.Config) !u8 {
         allocator.free(target_store);
     }
 
+    // `NIX_HELD_LOCKS` only has an effect on local fs stores.
+    const local_target_store = if (isLocalStore(target_store)) null else try daemonStoreAsLocalStore(allocator, target_store);
+    defer if (local_target_store) |lts| allocator.free(lts);
+
+    if (local_target_store) |lts| log.info(
+        "assuming store `{s}` to effectively be the same as current store `{s}`",
+        .{ lts, target_store },
+    );
+
     var hook_process = hook_process: {
         var args = std.ArrayListUnmanaged([]const u8){};
         defer args.deinit(allocator);
@@ -164,6 +173,9 @@ pub fn main(allocator: std.mem.Allocator, nix_config_env: nix.Config) !u8 {
             try nix_config.put("build-hook", value);
         }
         try nix_config.put("builders", nix_config_env.builders.value);
+        // If the build hook accepts, we need it to copy into a local fs store
+        // because `NIX_HELD_LOCKS` only works on local fs stores.
+        try nix_config.put("store", local_target_store orelse target_store);
 
         nix_config.hash_map.lockPointers();
         defer nix_config.hash_map.unlockPointers();
@@ -240,7 +252,8 @@ pub fn main(allocator: std.mem.Allocator, nix_config_env: nix.Config) !u8 {
             drv.drv_path,
             build_io.wanted_outputs,
             build_store,
-            nix_config.get("store").?,
+            target_store,
+            local_target_store,
             verbosity,
         ) catch |err| break :status err;
 
@@ -296,6 +309,7 @@ fn build(
     outputs: []const []const u8,
     build_store: []const u8,
     target_store: []const u8,
+    local_target_store: ?[]const u8,
     verbosity: nix.log.Action.Verbosity,
 ) !void {
     var installable = std.ArrayList(u8).init(allocator);
@@ -397,21 +411,13 @@ fn build(
     }
 
     {
-        // `NIX_HELD_LOCKS` only has an effect on the `nix copy` command with local fs stores.
-        const local_target_store = if (isLocalStore(target_store)) null else try daemonStoreAsLocalStore(allocator, target_store);
-        defer if (local_target_store) |lts| allocator.free(lts);
-
-        if (local_target_store) |lts| log.info(
-            "assuming store `{s}` to effectively be the same as current store `{s}` so that we can copy {s} into it",
-            .{ lts, target_store, installable.items },
-        );
-
         const cli = &.{
             "copy",
             "--no-check-sigs",
             "--from",
             build_store,
             "--to",
+            // `NIX_HELD_LOCKS` only has an effect on the `nix copy` command with local fs stores.
             local_target_store orelse target_store,
             installable.items, // XXX pass `output_paths` instead as that may be less work for Nix to figure out the actual store paths from the installable
         };

@@ -153,22 +153,29 @@ pub fn main() !u8 {
             std.log.err("{s}: failed to delete daemon socket: {s}", .{ @errorName(err), daemon_socket_path });
     }
 
-    const upstream_daemon_socket_path = upstream_daemon_socket_path: {
-        // `nix store info` resolves `--store auto`.
-        const store_info = store_info: {
-            var diagnostics: nix.ChildProcessDiagnostics = undefined;
-            errdefer |err| {
-                defer diagnostics.deinit(allocator);
-                std.log.err(
-                    "{s}: `nix store info --store {s}` terminated with {}\nstderr: {s}",
-                    .{ @errorName(err), nix_config_env.value.store.value, diagnostics.term, diagnostics.stderr },
-                );
-            }
-            break :store_info try nix.storeInfo(allocator, nix_config_env.value.store.value, &diagnostics);
-        };
-        defer store_info.deinit();
+    const args = try std.process.argsAlloc(allocator);
+    defer std.process.argsFree(allocator, args);
 
-        const store = store_info.value.url;
+    // `nix store info` resolves `--store auto`.
+    const target_store_info = target_store_info: {
+        const target_store = target_store: for (args[0 .. args.len - 1], args[1..]) |arg_flag, arg_value| {
+            if (std.mem.eql(u8, arg_flag, "--store")) break :target_store arg_value;
+        } else nix_config_env.value.store.value;
+
+        var diagnostics: nix.ChildProcessDiagnostics = undefined;
+        errdefer |err| {
+            defer diagnostics.deinit(allocator);
+            std.log.err(
+                "{s}: `nix store info --store {s}` terminated with {}\nstderr: {s}",
+                .{ @errorName(err), target_store, diagnostics.term, diagnostics.stderr },
+            );
+        }
+        break :target_store_info try nix.storeInfo(allocator, target_store, &diagnostics);
+    };
+    defer target_store_info.deinit();
+
+    const upstream_daemon_socket_path = upstream_daemon_socket_path: {
+        const store = target_store_info.value.url;
 
         break :upstream_daemon_socket_path if (std.mem.eql(u8, store, "daemon") or std.mem.startsWith(u8, store, "daemon?"))
             "/nix/var/nix/daemon-socket/socket"
@@ -207,9 +214,6 @@ pub fn main() !u8 {
         std.log.debug("{s}: failed to set thread name", .{@errorName(err)});
 
     var nix_process = nix_process: {
-        const args = try std.process.argsAlloc(allocator);
-        defer std.process.argsFree(allocator, args);
-
         const store_arg = try std.mem.concat(allocator, u8, &.{ "unix://", daemon_socket_path });
         defer allocator.free(store_arg);
 
@@ -226,9 +230,7 @@ pub fn main() !u8 {
         const builders_arg = try std.mem.join(allocator, &.{std.fs.path.delimiter}, &.{
             fifo_path,
             cache_dir_path,
-            target_store: for (args[0 .. args.len - 1], args[1..]) |arg_flag, arg_value| {
-                if (std.mem.eql(u8, arg_flag, "--store")) break :target_store arg_value;
-            } else nix_config_env.value.store.value,
+            target_store_info.value.url,
         });
         defer allocator.free(builders_arg);
 
