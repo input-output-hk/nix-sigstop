@@ -7,6 +7,10 @@ const nix = lib.nix;
 const hook = @import("hook.zig");
 
 pub const std_options = .{
+    .log_scope_levels = &.{
+        .{ .scope = .hook, .level = .debug },
+    },
+
     .logFn = struct {
         fn logFn(comptime message_level: std.log.Level, comptime scope: @Type(.EnumLiteral), comptime format: []const u8, args: anytype) void {
             switch (globals) {

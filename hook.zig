@@ -4,6 +4,8 @@ const lib = @import("lib");
 
 const nix = lib.nix;
 
+const log = lib.log.scoped(.hook);
+
 pub const Event = union(enum) {
     start: nix.build_hook.Derivation,
     /// the corresponding `start.drv_path`
@@ -15,11 +17,11 @@ pub const Event = union(enum) {
 
         const fifo_writer = fifo.writer();
 
-        if (std.log.defaultLogEnabled(.debug)) {
+        if (log.scopeLogEnabled(.debug)) {
             const json = try std.json.stringifyAlloc(allocator, self, .{});
             defer allocator.free(json);
 
-            std.log.debug("emitting IPC event: {s}", .{json});
+            log.debug("emitting IPC event: {s}", .{json});
 
             try fifo_writer.writeAll(json);
         } else try std.json.stringify(self, .{}, fifo_writer);
@@ -35,12 +37,12 @@ pub fn main(allocator: std.mem.Allocator, nix_config_env: nix.Config) !u8 {
 
         break :verbosity try nix.build_hook.parseArgs(&args);
     };
-    std.log.debug("log verbosity: {s}", .{@tagName(verbosity)});
+    log.debug("log verbosity: {s}", .{@tagName(verbosity)});
 
     var nix_config, var connection = try nix.build_hook.start(allocator);
     defer nix_config.deinit();
 
-    if (std.log.defaultLogEnabled(.debug)) {
+    if (log.scopeLogEnabled(.debug)) {
         var nix_config_msg = std.ArrayList(u8).init(allocator);
         defer nix_config_msg.deinit();
 
@@ -53,7 +55,7 @@ pub fn main(allocator: std.mem.Allocator, nix_config_env: nix.Config) !u8 {
             try nix_config_msg.append('\n');
         }
 
-        std.log.debug("nix config:\n{s}", .{nix_config_msg.items});
+        log.debug("nix config:\n{s}", .{nix_config_msg.items});
     }
 
     var fifo, const build_store, const target_store = builders: {
@@ -69,7 +71,7 @@ pub fn main(allocator: std.mem.Allocator, nix_config_env: nix.Config) !u8 {
             };
         } catch |err| switch (err) {
             error.NoBuilders => {
-                std.log.err(
+                log.err(
                     "expected nix config entry `builders` to have two entries separated by '{c}' but found {s}",
                     .{ std.fs.path.delimiter, builders },
                 );
@@ -78,23 +80,23 @@ pub fn main(allocator: std.mem.Allocator, nix_config_env: nix.Config) !u8 {
         };
 
         if (fifo_path.len == 0) {
-            std.log.err("expected path to FIFO for IPC in nix config entry `builders` but it is empty", .{});
+            log.err("expected path to FIFO for IPC in nix config entry `builders` but it is empty", .{});
             return error.NoBuilders;
         }
         if (!std.fs.path.isAbsolute(fifo_path)) {
-            std.log.err("path to FIFO for IPC is not absolute: {s}", .{fifo_path});
+            log.err("path to FIFO for IPC is not absolute: {s}", .{fifo_path});
             return error.AccessDenied;
         }
 
         if (build_store.len == 0) {
-            std.log.err("expected a store for building locally in nix config entry `builders` but it is empty", .{});
+            log.err("expected a store for building locally in nix config entry `builders` but it is empty", .{});
             return error.NoBuilders;
         }
 
-        std.log.debug("opening FIFO for IPC", .{});
+        log.debug("opening FIFO for IPC", .{});
         break :builders .{
             std.fs.openFileAbsolute(fifo_path, .{ .mode = .write_only }) catch |err| {
-                std.log.err("{s}: failed to open path to FIFO for IPC: {s}", .{ @errorName(err), fifo_path });
+                log.err("{s}: failed to open path to FIFO for IPC: {s}", .{ @errorName(err), fifo_path });
                 return err;
             },
             try allocator.dupe(u8, build_store),
@@ -128,9 +130,9 @@ pub fn main(allocator: std.mem.Allocator, nix_config_env: nix.Config) !u8 {
         break :hook_process hook_process;
     };
     errdefer |err| _ = hook_process.kill() catch |kill_err|
-        std.log.err("{s}: {s}: failed to kill build hook", .{ @errorName(err), @errorName(kill_err) });
+        log.err("{s}: {s}: failed to kill build hook", .{ @errorName(err), @errorName(kill_err) });
 
-    std.log.debug("spawned build hook. PID: {d}", .{hook_process.id});
+    log.debug("spawned build hook. PID: {d}", .{hook_process.id});
 
     var hook_response_pipe_read, var hook_response_pipe_write = hook_response_pipe: {
         const pipe_read, const pipe_write = try std.posix.pipe();
@@ -149,7 +151,7 @@ pub fn main(allocator: std.mem.Allocator, nix_config_env: nix.Config) !u8 {
         hook_response_pipe_write.writer(),
     });
     hook_stderr_thread.setName(lib.mem.capConst(u8, "hook stderr", std.Thread.max_name_len, .end)) catch |err|
-        std.log.debug("{s}: failed to set thread name", .{@errorName(err)});
+        log.debug("{s}: failed to set thread name", .{@errorName(err)});
     defer hook_stderr_thread.join();
 
     const hook_stdin_writer = hook_process.stdin.?.writer();
@@ -166,23 +168,23 @@ pub fn main(allocator: std.mem.Allocator, nix_config_env: nix.Config) !u8 {
         nix_config.hash_map.lockPointers();
         defer nix_config.hash_map.unlockPointers();
 
-        std.log.debug("initializing build hook", .{});
+        log.debug("initializing build hook", .{});
         try (nix.build_hook.Initialization{ .nix_config = nix_config }).write(hook_stdin_writer);
     }
 
     const drv, const build_io, const accepted = accept: while (true) {
-        std.log.debug("reading derivation request", .{});
+        log.debug("reading derivation request", .{});
         const drv = try connection.readDerivation(allocator);
         errdefer drv.deinit(allocator);
 
-        std.log.debug("requesting build from build hook: {s}", .{drv.drv_path});
+        log.debug("requesting build from build hook: {s}", .{drv.drv_path});
         try (nix.build_hook.Request{ .derivation = drv }).write(hook_stdin_writer);
 
-        std.log.debug("reading response from build hook", .{});
+        log.debug("reading response from build hook", .{});
         const hook_response = try nix.build_hook.Response.read(allocator, hook_response_pipe_read.reader());
         defer hook_response.deinit(allocator);
 
-        std.log.debug("build hook responded with \"{s}\"", .{@tagName(std.meta.activeTag(hook_response))});
+        log.debug("build hook responded with \"{s}\"", .{@tagName(std.meta.activeTag(hook_response))});
 
         switch (hook_response) {
             .postpone => {
@@ -191,7 +193,7 @@ pub fn main(allocator: std.mem.Allocator, nix_config_env: nix.Config) !u8 {
                 drv.deinit(allocator);
             },
             .accept => |remote_store| {
-                std.log.debug("building remotely in {s}", .{remote_store});
+                log.debug("building remotely in {s}", .{remote_store});
 
                 const build_io = try connection.accept(allocator, remote_store);
                 errdefer build_io.deinit(allocator);
@@ -204,7 +206,7 @@ pub fn main(allocator: std.mem.Allocator, nix_config_env: nix.Config) !u8 {
                 // XXX Cache `decline_permanently` so that we don't have
                 // to ask the build hook for the remaining derivations.
 
-                std.log.debug("building locally in {s}", .{build_store});
+                log.debug("building locally in {s}", .{build_store});
 
                 break :accept .{
                     drv,
@@ -222,10 +224,10 @@ pub fn main(allocator: std.mem.Allocator, nix_config_env: nix.Config) !u8 {
     try (Event{ .start = drv }).emit(allocator, fifo);
 
     const status = status: {
-        std.log.debug("waiting for build hook to exit", .{});
+        log.debug("waiting for build hook to exit", .{});
         if (hook_process.wait()) |term| {
             if (term != .Exited or term.Exited != 0) {
-                std.log.info("build hook terminated with {}", .{term});
+                log.info("build hook terminated with {}", .{term});
                 break :status switch (term) {
                     .Exited => |code| code,
                     else => 1,
@@ -247,7 +249,7 @@ pub fn main(allocator: std.mem.Allocator, nix_config_env: nix.Config) !u8 {
 
     (Event{ .done = drv.drv_path }).emit(allocator, fifo) catch |err| {
         _ = status catch |status_err|
-            std.log.err("{s}: failed to handle final hook response", .{@errorName(status_err)});
+            log.err("{s}: failed to handle final hook response", .{@errorName(status_err)});
 
         // XXX Should be able to just `return err` but it seems that fails peer type resolution.
         // Could this be a compiler bug? This only happens if we have an `errdefer` with capture
@@ -266,7 +268,7 @@ fn process_hook_stderr(stderr_reader: anytype, protocol_writer: anytype) !void {
         // Capacity is arbitrary but should suffice for any lines encountered in practice.
         var log_buf = std.BoundedArray(u8, 1024 * 512){};
 
-        std.log.debug("waiting for a log line from the build hook", .{});
+        log.debug("waiting for a log line from the build hook", .{});
 
         // The build hook and logging protocols are line-based.
         log_reader.streamUntilDelimiter(log_buf.writer(), '\n', log_buf.capacity() + 1) catch |err| switch (err) {
@@ -274,7 +276,7 @@ fn process_hook_stderr(stderr_reader: anytype, protocol_writer: anytype) !void {
             else => return err,
         };
 
-        std.log.debug("forwarding a log line of {d} bytes from the build hook", .{log_buf.len});
+        log.debug("forwarding a log line of {d} bytes from the build hook", .{log_buf.len});
 
         std.debug.getStderrMutex().lock();
         defer std.debug.getStderrMutex().unlock();
@@ -285,7 +287,7 @@ fn process_hook_stderr(stderr_reader: anytype, protocol_writer: anytype) !void {
         try stderr_writer.writeByte('\n');
     }
 
-    std.log.debug("build hook closed stderr", .{});
+    log.debug("build hook closed stderr", .{});
 }
 
 fn build(
@@ -306,7 +308,7 @@ fn build(
         try installable.appendSlice(output);
     }
 
-    std.log.info("building {s}", .{installable.items});
+    log.info("building {s}", .{installable.items});
 
     {
         const cli = &.{
@@ -324,10 +326,10 @@ fn build(
 
         var process = std.process.Child.init(args, allocator);
 
-        std.log.debug("running `nix {s}`", .{lib.fmt.join(" ", cli)});
+        log.debug("running `nix {s}`", .{lib.fmt.join(" ", cli)});
         const term = try process.spawnAndWait();
         if (term != .Exited or term.Exited != 0) {
-            std.log.err("`nix {s}` failed: {}", .{ lib.fmt.join(" ", cli), term });
+            log.err("`nix {s}` failed: {}", .{ lib.fmt.join(" ", cli), term });
             return error.NixCopyTo;
         }
     }
@@ -347,11 +349,11 @@ fn build(
 
         var process = std.process.Child.init(args, allocator);
 
-        std.log.debug("running `nix {s}`", .{lib.fmt.join(" ", cli)});
+        log.debug("running `nix {s}`", .{lib.fmt.join(" ", cli)});
         const term = try process.spawnAndWait();
         if (term != .Exited or term.Exited != 0) {
-            std.log.err("`nix {s}` failed: {}", .{ lib.fmt.join(" ", cli), term });
-            if (build_store[0] == std.fs.path.sep) std.log.warn(
+            log.err("`nix {s}` failed: {}", .{ lib.fmt.join(" ", cli), term });
+            if (build_store[0] == std.fs.path.sep) log.warn(
                 \\{s} looks like a chroot store.
                 \\Please ensure I have read and execute permission on all parent directories.
                 \\See https://github.com/NixOS/nixpkgs/pull/90431 for more information.
@@ -365,7 +367,7 @@ fn build(
     {
         const args = &.{ "nix", "derivation", "show", installable.items };
 
-        std.log.debug("running `{s}`", .{lib.fmt.join(" ", args)});
+        log.debug("running `{s}`", .{lib.fmt.join(" ", args)});
         const result = try std.process.Child.run(.{
             .allocator = allocator,
             .argv = args,
@@ -377,14 +379,14 @@ fn build(
         }
 
         if (result.term != .Exited or result.term.Exited != 0) {
-            std.log.err("`{s}` failed: {}\nstdout: {s}\nstderr: {s}", .{ lib.fmt.join(" ", args), result.term, result.stdout, result.stderr });
+            log.err("`{s}` failed: {}\nstdout: {s}\nstderr: {s}", .{ lib.fmt.join(" ", args), result.term, result.stdout, result.stderr });
             return error.NixDerivationShow;
         }
 
         const parsed = std.json.parseFromSlice(std.json.ArrayHashMap(struct {
             outputs: std.json.ArrayHashMap(struct { path: []const u8 }),
         }), allocator, result.stdout, .{ .ignore_unknown_fields = true }) catch |err| {
-            std.log.err("{s}: failed to parse output of `{s}`\nstdout: {s}\nstderr: {s}", .{ @errorName(err), lib.fmt.join(" ", args), result.stdout, result.stderr });
+            log.err("{s}: failed to parse output of `{s}`\nstdout: {s}\nstderr: {s}", .{ @errorName(err), lib.fmt.join(" ", args), result.stdout, result.stderr });
             return err;
         };
         defer parsed.deinit();
@@ -399,7 +401,7 @@ fn build(
         const local_target_store = if (isLocalStore(target_store)) null else try daemonStoreAsLocalStore(allocator, target_store);
         defer if (local_target_store) |lts| allocator.free(lts);
 
-        if (local_target_store) |lts| std.log.info(
+        if (local_target_store) |lts| log.info(
             "assuming store `{s}` to effectively be the same as current store `{s}` so that we can copy {s} into it",
             .{ lts, target_store, installable.items },
         );
@@ -449,10 +451,10 @@ fn build(
         const format = "`{s}={s} nix {s}`";
         const format_args = .{ key_nix_held_locks, env.get(key_nix_held_locks).?, lib.fmt.join(" ", cli) };
 
-        std.log.debug("running " ++ format, format_args);
+        log.debug("running " ++ format, format_args);
         const term = try process.spawnAndWait();
         if (term != .Exited or term.Exited != 0) {
-            std.log.err(format ++ " failed: {}", format_args ++ .{term});
+            log.err(format ++ " failed: {}", format_args ++ .{term});
             return error.NixCopyFrom;
         }
     }
