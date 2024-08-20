@@ -291,13 +291,18 @@ fn process_hook_stderr(stderr_reader: anytype, protocol_writer: anytype) !void {
 
         log.debug("forwarding a log line of {d} bytes from the build hook", .{log_buf.len});
 
+        var buffered_stderr_writer = std.io.bufferedWriter(std.io.getStdErr().writer());
+        const stderr_writer = buffered_stderr_writer.writer();
+
         std.debug.getStderrMutex().lock();
         defer std.debug.getStderrMutex().unlock();
 
-        const stderr_writer = std.io.getStdErr().writer();
+        nosuspend {
+            try stderr_writer.writeAll(log_buf.constSlice());
+            try stderr_writer.writeByte('\n');
 
-        try stderr_writer.writeAll(log_buf.constSlice());
-        try stderr_writer.writeByte('\n');
+            try buffered_stderr_writer.flush();
+        }
     }
 
     log.debug("build hook closed stderr", .{});
