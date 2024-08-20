@@ -435,8 +435,8 @@ fn proxyDaemonSocket(
                     std.log.debug("finished proxying nix client connection: {s}", .{@tagName(reason)});
                 }
             }.call, .{.{ allocator, connection.stream.handle, upstream.handle, done.handle, .{
-                .fifo_max_size = 8 * lib.mem.b_per_mib,
-                .fifo_desired_size = lib.mem.b_per_mib,
+                .fifo_max_size = lib.mem.b_per_gib,
+                .fifo_desired_size = 8 * lib.mem.b_per_mib,
             } }});
         }
 
