@@ -378,6 +378,9 @@ fn proxyDaemonSocket(
     /// Will never have any data.
     done: std.fs.File,
 ) !void {
+    const posix = std.posix;
+    const POLL = posix.POLL;
+
     var wg = std.Thread.WaitGroup{};
 
     defer {
@@ -391,24 +394,24 @@ fn proxyDaemonSocket(
     defer std.log.debug("accepting no more nix client connections", .{});
 
     // We cannot use `std.io.poll()` for this
-    // because it does `std.posix.read()` on `std.posix.POLL.IN` events.
-    var poll_fds = [2]std.posix.pollfd{
+    // because it does `posix.read()` on `POLL.IN` events.
+    var poll_fds = [2]posix.pollfd{
         .{
             .fd = server.stream.handle,
-            .events = std.posix.POLL.IN,
+            .events = POLL.IN,
             .revents = undefined,
         },
         .{
             .fd = done.handle,
-            .events = std.posix.POLL.HUP,
+            .events = POLL.HUP,
             .revents = undefined,
         },
     };
 
     poll: while (true) {
-        std.debug.assert(try std.posix.poll(&poll_fds, -1) != 0);
+        std.debug.assert(try posix.poll(&poll_fds, -1) != 0);
 
-        if (poll_fds[0].revents & std.posix.POLL.IN != 0) {
+        if (poll_fds[0].revents & POLL.IN != 0) {
             const connection = server.accept() catch |err| switch (err) {
                 error.SocketNotListening, error.ConnectionAborted => break,
                 else => return err,
@@ -437,11 +440,11 @@ fn proxyDaemonSocket(
             } }});
         }
 
-        if (poll_fds[1].revents & std.posix.POLL.HUP == std.posix.POLL.HUP)
+        if (poll_fds[1].revents & POLL.HUP == POLL.HUP)
             break;
 
         inline for (poll_fds, .{ "nix daemon server", "done pipe" }) |poll_fd, name|
-            if (poll_fd.fd & (std.posix.POLL.ERR | std.posix.POLL.NVAL) != 0) {
+            if (poll_fd.fd & (POLL.ERR | POLL.NVAL | POLL.HUP) != 0) {
                 std.log.err("error polling {s}. revents: 0x{X}", .{ name, poll_fd.revents });
                 break :poll;
             };
