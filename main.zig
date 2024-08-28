@@ -427,17 +427,34 @@ fn proxyDaemonSocket(
             errdefer upstream.close();
 
             wg.spawnManager(struct {
-                fn call(args: anytype) void {
-                    const reason = @call(.auto, lib.posix.proxyDuplex, args) catch |err| {
+                fn work(
+                    allocator_: std.mem.Allocator,
+                    connection_: std.net.Server.Connection,
+                    upstream_: std.net.Stream,
+                    done_: std.fs.File,
+                ) void {
+                    defer {
+                        connection_.stream.close();
+                        upstream_.close();
+                    }
+
+                    const reason = @call(.auto, lib.posix.proxyDuplex, .{
+                        allocator_,
+                        connection_.stream.handle,
+                        upstream_.handle,
+                        done_.handle,
+                        .{
+                            .fifo_max_size = lib.mem.b_per_gib,
+                            .fifo_desired_size = 8 * lib.mem.b_per_mib,
+                        },
+                    }) catch |err| {
                         std.log.err("{s}: error proxying nix client connection", .{@errorName(err)});
                         return;
                     };
+
                     std.log.debug("finished proxying nix client connection: {s}", .{@tagName(reason)});
                 }
-            }.call, .{.{ allocator, connection.stream.handle, upstream.handle, done.handle, .{
-                .fifo_max_size = lib.mem.b_per_gib,
-                .fifo_desired_size = 8 * lib.mem.b_per_mib,
-            } }});
+            }.work, .{ allocator, connection, upstream, done });
         }
 
         if (poll_fds[1].revents & POLL.HUP == POLL.HUP)
