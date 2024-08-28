@@ -447,6 +447,7 @@ fn proxyDaemonSocket(
                             .fifo_max_size = lib.mem.b_per_gib,
                             .fifo_desired_size = 8 * lib.mem.b_per_mib,
                         },
+                        .{},
                     }) catch |err| {
                         std.log.err("{s}: error proxying nix client connection", .{@errorName(err)});
                         return;
