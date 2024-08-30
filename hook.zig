@@ -155,7 +155,7 @@ pub fn main(allocator: std.mem.Allocator, nix_config_env: nix.Config) !u8 {
         hook_response_pipe_write.close();
     }
 
-    const hook_stderr_thread = try std.Thread.spawn(.{}, process_hook_stderr, .{
+    const hook_stderr_thread = try std.Thread.spawn(.{}, processHookStderr, .{
         hook_process.stderr.?.reader(),
         hook_response_pipe_write.writer(),
     });
@@ -273,7 +273,7 @@ pub fn main(allocator: std.mem.Allocator, nix_config_env: nix.Config) !u8 {
     return status;
 }
 
-fn process_hook_stderr(stderr_reader: anytype, protocol_writer: anytype) !void {
+fn processHookStderr(stderr_reader: anytype, protocol_writer: anytype) !void {
     var log_stream = nix.log.logStream(stderr_reader, protocol_writer);
     const log_reader = log_stream.reader();
 
