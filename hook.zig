@@ -3,6 +3,7 @@ const std = @import("std");
 const lib = @import("lib");
 
 const nix = lib.nix;
+const posix = lib.posix;
 
 const log = lib.log.scoped(.hook);
 
@@ -138,8 +139,16 @@ pub fn main(allocator: std.mem.Allocator, nix_config_env: nix.Config) !u8 {
 
         break :hook_process hook_process;
     };
-    errdefer |err| _ = hook_process.kill() catch |kill_err|
-        log.err("{s}: {s}: failed to kill build hook", .{ @errorName(err), @errorName(kill_err) });
+    var hook_stderr_thread: ?std.Thread = null;
+    errdefer |err| {
+        _ = hook_process.kill() catch |kill_err| {
+            log.err("{s}: {s}: failed to kill build hook", .{ @errorName(err), @errorName(kill_err) });
+
+            if (hook_stderr_thread) |t| t.detach();
+        };
+
+        if (hook_stderr_thread) |t| t.join();
+    }
 
     log.debug("spawned build hook. PID: {d}", .{hook_process.id});
 
@@ -155,13 +164,12 @@ pub fn main(allocator: std.mem.Allocator, nix_config_env: nix.Config) !u8 {
         hook_response_pipe_write.close();
     }
 
-    const hook_stderr_thread = try std.Thread.spawn(.{}, processHookStderr, .{
-        hook_process.stderr.?.reader(),
+    hook_stderr_thread = try std.Thread.spawn(.{}, processHookStderr, .{
+        (posix.PollingStream{ .fd = hook_process.stderr.?.handle }).reader(),
         hook_response_pipe_write.writer(),
     });
-    hook_stderr_thread.setName(lib.mem.capConst(u8, "hook stderr", std.Thread.max_name_len, .end)) catch |err|
+    hook_stderr_thread.?.setName(lib.mem.capConst(u8, "hook stderr", std.Thread.max_name_len, .end)) catch |err|
         log.debug("{s}: failed to set thread name", .{@errorName(err)});
-    defer hook_stderr_thread.join();
 
     const hook_stdin_writer = hook_process.stdin.?.writer();
 
@@ -236,6 +244,14 @@ pub fn main(allocator: std.mem.Allocator, nix_config_env: nix.Config) !u8 {
     try (Event{ .start = drv }).emit(allocator, fifo);
 
     const status = status: {
+        log.debug("waiting for build hook to close its stderr", .{});
+        // `hook_stderr_thread` polls and waits until
+        // `hook_process` closes the write end of its stderr pipe.
+        // We must wait for that before calling `hook_process.wait()`
+        // because that closes the read end of the stderr pipe
+        // and we must not do that while `hook_stderr_thread` is still using it.
+        hook_stderr_thread.?.join();
+
         log.debug("waiting for build hook to exit", .{});
         if (hook_process.wait()) |term| {
             if (term != .Exited or term.Exited != 0) {
@@ -274,22 +290,30 @@ pub fn main(allocator: std.mem.Allocator, nix_config_env: nix.Config) !u8 {
 }
 
 fn processHookStderr(stderr_reader: anytype, protocol_writer: anytype) !void {
-    var log_stream = nix.log.logStream(stderr_reader, protocol_writer);
+    errdefer |err| std.debug.panic("{s}: error processing build hook's stderr", .{@errorName(err)});
+
+    var stderr_buffered = std.io.bufferedReader(stderr_reader);
+
+    var log_stream = nix.log.logStream(stderr_buffered.reader(), protocol_writer);
     const log_reader = log_stream.reader();
 
     while (true) {
         // Capacity is arbitrary but should suffice for any lines encountered in practice.
-        var log_buf = std.BoundedArray(u8, 1024 * 512){};
+        var log_line_buf = std.BoundedArray(u8, 1024 * 512){};
 
         log.debug("waiting for a log line from the build hook", .{});
 
         // The build hook and logging protocols are line-based.
-        log_reader.streamUntilDelimiter(log_buf.writer(), '\n', log_buf.capacity() + 1) catch |err| switch (err) {
-            error.EndOfStream => break,
-            else => return err,
+        log_reader.streamUntilDelimiter(log_line_buf.writer(), '\n', log_line_buf.capacity() + 1) catch |err| switch (err) {
+            error.NotOpenForReading, error.EndOfStream => break,
+            error.StreamTooLong => std.debug.panic("bug: buffer for hook log line is too small", .{}),
+            // XXX Should be able to just `return err` but it seems that fails peer type resolution.
+            // Could this be a compiler bug? This only happens if we have an `errdefer` with capture
+            // in the enclosing block. In our case this is the `errdefer` that panics.
+            else => |e| return @as((@TypeOf(log_reader).Error || @TypeOf(log_line_buf).Writer.Error)!void, e),
         };
 
-        log.debug("forwarding a log line of {d} bytes from the build hook", .{log_buf.len});
+        log.debug("forwarding a log line of {d} bytes from the build hook", .{log_line_buf.len});
 
         var buffered_stderr_writer = std.io.bufferedWriter(std.io.getStdErr().writer());
         const stderr_writer = buffered_stderr_writer.writer();
@@ -298,7 +322,7 @@ fn processHookStderr(stderr_reader: anytype, protocol_writer: anytype) !void {
         defer std.debug.getStderrMutex().unlock();
 
         nosuspend {
-            try stderr_writer.writeAll(log_buf.constSlice());
+            try stderr_writer.writeAll(log_line_buf.constSlice());
             try stderr_writer.writeByte('\n');
 
             try buffered_stderr_writer.flush();
