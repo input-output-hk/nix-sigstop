@@ -165,7 +165,7 @@ pub fn main(allocator: std.mem.Allocator, nix_config_env: nix.Config) !u8 {
     }
 
     hook_stderr_thread = try std.Thread.spawn(.{}, processHookStderr, .{
-        (posix.PollingStream{ .fd = hook_process.stderr.?.handle }).reader(),
+        (posix.PollingStream(.fd){ .handle = hook_process.stderr.?.handle }).reader(),
         hook_response_pipe_write.writer(),
     });
     hook_stderr_thread.?.setName(lib.mem.capConst(u8, "hook stderr", std.Thread.max_name_len, .end)) catch |err|
