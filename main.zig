@@ -330,12 +330,6 @@ fn processEvents(
                     .start => |msg| {
                         num_building += 1;
                         std.log.info("build started: {s}", .{msg.drv_path});
-
-                        if (num_building == 1) {
-                            std.log.info("stopping the nix client process", .{});
-                            try proxy_daemon_socket_ctrl.ignore(.downstream);
-                            try std.posix.kill(pid, std.posix.SIG.STOP);
-                        }
                     },
                     .done => |msg| {
                         num_building -= 1;
@@ -345,7 +339,11 @@ fn processEvents(
 
                 std.log.info("{d} builds running", .{num_building});
 
-                if (num_building == 0) {
+                if (event.value == .start and num_building == 1) {
+                    std.log.info("stopping the nix client process", .{});
+                    try proxy_daemon_socket_ctrl.ignore(.downstream);
+                    try std.posix.kill(pid, std.posix.SIG.STOP);
+                } else if (num_building == 0) {
                     std.log.info("continuing the nix client process", .{});
                     try std.posix.kill(pid, std.posix.SIG.CONT);
                     try proxy_daemon_socket_ctrl.unignore(.downstream);
