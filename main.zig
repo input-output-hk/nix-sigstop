@@ -209,7 +209,10 @@ pub fn main() !u8 {
         done_pipe_read.close();
     }
 
-    proxy_daemon_socket_thread = try std.Thread.spawn(.{}, proxyDaemonSocket, .{ allocator, &daemon_server, upstream_daemon_socket_path, done_pipe_read });
+    var proxy_daemon_socket_ctrl = lib.posix.ProxyDuplexControl.init(allocator);
+    defer proxy_daemon_socket_ctrl.deinit();
+
+    proxy_daemon_socket_thread = try std.Thread.spawn(.{}, proxyDaemonSocket, .{ allocator, &daemon_server, upstream_daemon_socket_path, done_pipe_read, &proxy_daemon_socket_ctrl });
     proxy_daemon_socket_thread.?.setName(lib.mem.capConst(u8, "daemon proxy", std.Thread.max_name_len, .end)) catch |err|
         std.log.debug("{s}: failed to set thread name", .{@errorName(err)});
 
@@ -254,7 +257,7 @@ pub fn main() !u8 {
     };
     globals.wrapper = nix_process.id;
 
-    process_events_thread = try std.Thread.spawn(.{}, processEvents, .{ allocator, fifo_path, done_pipe_read, nix_process.id });
+    process_events_thread = try std.Thread.spawn(.{}, processEvents, .{ allocator, fifo_path, done_pipe_read, nix_process.id, &proxy_daemon_socket_ctrl });
     process_events_thread.?.setName(lib.mem.capConst(u8, "hook events", std.Thread.max_name_len, .end)) catch |err|
         std.log.debug("{s}: failed to set thread name", .{@errorName(err)});
 
@@ -287,6 +290,7 @@ fn processEvents(
     /// Will never have any data.
     done: std.fs.File,
     pid: std.process.Child.Id,
+    proxy_daemon_socket_ctrl: *lib.posix.ProxyDuplexControl,
 ) !void {
     var num_building: u32 = 0;
 
@@ -329,6 +333,7 @@ fn processEvents(
 
                         if (num_building == 1) {
                             std.log.info("stopping the nix client process", .{});
+                            try proxy_daemon_socket_ctrl.ignore(.downstream);
                             try std.posix.kill(pid, std.posix.SIG.STOP);
                         }
                     },
@@ -343,6 +348,7 @@ fn processEvents(
                 if (num_building == 0) {
                     std.log.info("continuing the nix client process", .{});
                     try std.posix.kill(pid, std.posix.SIG.CONT);
+                    try proxy_daemon_socket_ctrl.unignore(.downstream);
                 }
 
                 if (end_pos + 1 == fifo_readable.len)
@@ -377,6 +383,7 @@ fn proxyDaemonSocket(
     /// The nix command is done when the other end of this pipe is closed.
     /// Will never have any data.
     done: std.fs.File,
+    control: *lib.posix.ProxyDuplexControl,
 ) !void {
     const posix = std.posix;
     const POLL = posix.POLL;
@@ -432,6 +439,7 @@ fn proxyDaemonSocket(
                     connection_: std.net.Server.Connection,
                     upstream_: std.net.Stream,
                     done_: std.fs.File,
+                    control_: *lib.posix.ProxyDuplexControl,
                 ) void {
                     defer {
                         connection_.stream.close();
@@ -446,8 +454,9 @@ fn proxyDaemonSocket(
                         },
                         connection_.stream.handle,
                         upstream_.handle,
-                        done_.handle,
                         .{
+                            .cancel = done_.handle,
+                            .control = control_,
                             .fifo_max_size = lib.mem.b_per_gib,
                             .fifo_desired_size = 8 * lib.mem.b_per_mib,
                         },
@@ -458,7 +467,7 @@ fn proxyDaemonSocket(
 
                     std.log.debug("finished proxying nix client connection: {s}", .{@tagName(reason)});
                 }
-            }.work, .{ allocator, connection, upstream, done });
+            }.work, .{ allocator, connection, upstream, done, control });
         }
 
         if (poll_fds[1].revents & POLL.HUP == POLL.HUP)
