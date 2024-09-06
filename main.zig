@@ -188,6 +188,9 @@ pub fn main() !u8 {
     };
     std.log.debug("upstream nix daemon socket: {s}", .{upstream_daemon_socket_path});
 
+    var proxy_daemon_socket_ctrl = lib.posix.ProxyDuplexControl.init(allocator);
+    defer proxy_daemon_socket_ctrl.deinit();
+
     var process_events_thread: ?std.Thread = null;
 
     const done_pipe_read, const done_pipe_write = done_pipe: {
@@ -208,9 +211,6 @@ pub fn main() !u8 {
 
         done_pipe_read.close();
     }
-
-    var proxy_daemon_socket_ctrl = lib.posix.ProxyDuplexControl.init(allocator);
-    defer proxy_daemon_socket_ctrl.deinit();
 
     proxy_daemon_socket_thread = try std.Thread.spawn(.{}, proxyDaemonSocket, .{ allocator, &daemon_server, upstream_daemon_socket_path, done_pipe_read, &proxy_daemon_socket_ctrl });
     proxy_daemon_socket_thread.?.setName(lib.mem.capConst(u8, "daemon proxy", std.Thread.max_name_len, .end)) catch |err|
