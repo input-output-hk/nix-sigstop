@@ -141,11 +141,6 @@ pub fn main() !u8 {
     });
     defer allocator.free(daemon_socket_path);
 
-    // This `defer` statement needs to be above that of `daemon_server`
-    // as that closes the socket, thereby making `accept()` return,
-    // unblocking `join()`. Otherwise this is a deadlock.
-    var proxy_daemon_socket_thread: ?std.Thread = null;
-
     var daemon_server = try (try std.net.Address.initUnix(daemon_socket_path)).listen(.{ .kernel_backlog = 0 });
     defer {
         daemon_server.deinit();
@@ -191,6 +186,7 @@ pub fn main() !u8 {
     var proxy_daemon_socket_ctrl = lib.posix.ProxyDuplexControl.init(allocator);
     defer proxy_daemon_socket_ctrl.deinit();
 
+    var proxy_daemon_socket_thread: ?std.Thread = null;
     var process_events_thread: ?std.Thread = null;
 
     const done_pipe_read, const done_pipe_write = done_pipe: {
