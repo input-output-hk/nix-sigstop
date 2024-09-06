@@ -272,8 +272,8 @@ pub fn main() !u8 {
     if (nix_process.resource_usage_statistics.getMaxRss()) |max_rss|
         std.log.info("max RSS: {d} bytes / {d:.2} MiB / {d:.2} GiB", .{
             max_rss,
-            @as(f32, @floatFromInt(max_rss)) / 1024 / 1024,
-            @as(f32, @floatFromInt(max_rss)) / 1024 / 1024 / 1024,
+            @as(f32, @floatFromInt(max_rss)) / lib.mem.b_per_mib,
+            @as(f32, @floatFromInt(max_rss)) / lib.mem.b_per_gib,
         });
 
     return switch (term) {

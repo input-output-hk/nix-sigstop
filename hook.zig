@@ -299,7 +299,7 @@ fn processHookStderr(stderr_reader: anytype, protocol_writer: anytype) !void {
 
     while (true) {
         // Capacity is arbitrary but should suffice for any lines encountered in practice.
-        var log_line_buf = std.BoundedArray(u8, 1024 * 512){};
+        var log_line_buf = std.BoundedArray(u8, lib.mem.b_per_mib / 2){};
 
         log.debug("waiting for a log line from the build hook", .{});
 
@@ -414,7 +414,7 @@ fn build(
         const result = try std.process.Child.run(.{
             .allocator = allocator,
             .argv = args,
-            .max_output_bytes = 1024 * 512,
+            .max_output_bytes = lib.mem.b_per_mib / 2,
         });
         defer {
             allocator.free(result.stdout);
