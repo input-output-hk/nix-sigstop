@@ -318,8 +318,8 @@ fn processHookStderr(stderr_reader: anytype, protocol_writer: anytype) !void {
         var buffered_stderr_writer = std.io.bufferedWriter(std.io.getStdErr().writer());
         const stderr_writer = buffered_stderr_writer.writer();
 
-        std.debug.getStderrMutex().lock();
-        defer std.debug.getStderrMutex().unlock();
+        std.debug.lockStdErr();
+        defer std.debug.unlockStdErr();
 
         nosuspend {
             try stderr_writer.writeAll(log_line_buf.constSlice());
