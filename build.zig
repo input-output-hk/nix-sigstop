@@ -44,5 +44,5 @@ pub fn build(b: *std.Build) !void {
 
 fn addDependencyImports(b: *std.Build, module: *std.Build.Module, opts: anytype) void {
     module.addImport("lib", b.dependency("lib", opts).module("lib"));
-    module.addImport("known-folders", b.dependency("known-folders", .{}).module("known-folders"));
+    module.addImport("known-folders", b.dependency("known-folders", opts).module("known-folders"));
 }
