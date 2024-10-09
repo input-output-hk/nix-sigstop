@@ -2,10 +2,13 @@
     .name = "nix-sigstop",
     .version = "0.0.0",
     .dependencies = .{
-        .lib = .{ .path = "../lib" },
         .@"known-folders" = .{
             .url = "https://github.com/ziglibs/known-folders/archive/1cceeb70e77dec941a4178160ff6c8d05a74de6f.tar.gz",
             .hash = "12205f5e7505c96573f6fc5144592ec38942fb0a326d692f9cddc0c7dd38f9028f29",
+        },
+        .utils = .{
+            .url = "https://github.com/dermetfan/utils.zig/archive/c1c8e7ed6e1f610af3bf5e4de677c19482e0deba.tar.gz",
+            .hash = "122061dbc38c8c05e5c50bd51f35598c0fc2863efd4ef207af6079bc9c16792c2ead",
         },
     },
     .paths = .{
@@ -13,6 +16,5 @@
         "build.zig.zon",
         "main.zig",
         "hook.zig",
-        "../lib",
     },
 }

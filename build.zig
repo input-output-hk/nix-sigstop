@@ -1,6 +1,6 @@
 const std = @import("std");
 
-const lib = @import("lib").lib;
+const utils = @import("utils").utils;
 
 pub fn build(b: *std.Build) !void {
     const opts = .{
@@ -39,10 +39,10 @@ pub fn build(b: *std.Build) !void {
         test_step.dependOn(&run_exe_test.step);
     }
 
-    _ = lib.addCheckTls(b);
+    _ = utils.addCheckTls(b);
 }
 
 fn addDependencyImports(b: *std.Build, module: *std.Build.Module, opts: anytype) void {
-    module.addImport("lib", b.dependency("lib", opts).module("lib"));
+    module.addImport("utils", b.dependency("utils", opts).module("utils"));
     module.addImport("known-folders", b.dependency("known-folders", opts).module("known-folders"));
 }

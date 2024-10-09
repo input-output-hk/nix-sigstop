@@ -1,11 +1,11 @@
 const builtin = @import("builtin");
 const std = @import("std");
-const lib = @import("lib");
+const utils = @import("utils");
 
-const nix = lib.nix;
-const posix = lib.posix;
+const nix = utils.nix;
+const posix = utils.posix;
 
-const log = lib.log.scoped(.hook);
+const log = utils.log.scoped(.hook);
 
 pub const Event = union(enum) {
     start: nix.build_hook.Derivation,
@@ -168,7 +168,7 @@ pub fn main(allocator: std.mem.Allocator, nix_config_env: nix.Config) !u8 {
         (posix.PollingStream(.fd){ .handle = hook_process.stderr.?.handle }).reader(),
         hook_response_pipe_write.writer(),
     });
-    hook_stderr_thread.?.setName(lib.mem.capConst(u8, "hook stderr", std.Thread.max_name_len, .end)) catch |err|
+    hook_stderr_thread.?.setName(utils.mem.capConst(u8, "hook stderr", std.Thread.max_name_len, .end)) catch |err|
         log.debug("{s}: failed to set thread name", .{@errorName(err)});
 
     const hook_stdin_writer = hook_process.stdin.?.writer();
@@ -283,7 +283,7 @@ pub fn main(allocator: std.mem.Allocator, nix_config_env: nix.Config) !u8 {
         // XXX Should be able to just `return err` but it seems that fails peer type resolution.
         // Could this be a compiler bug? This only happens if we have an `errdefer` with capture
         // in the enclosing block. In our case this is the `errdefer` that kills `hook_process`.
-        return @as(lib.meta.FnErrorSet(@TypeOf(Event.emit))!u8, err);
+        return @as(utils.meta.FnErrorSet(@TypeOf(Event.emit))!u8, err);
     };
 
     return status;
@@ -299,7 +299,7 @@ fn processHookStderr(stderr_reader: anytype, protocol_writer: anytype) !void {
 
     while (true) {
         // Capacity is arbitrary but should suffice for any lines encountered in practice.
-        var log_line_buf = std.BoundedArray(u8, lib.mem.b_per_mib / 2){};
+        var log_line_buf = std.BoundedArray(u8, utils.mem.b_per_mib / 2){};
 
         log.debug("waiting for a log line from the build hook", .{});
 
@@ -369,10 +369,10 @@ fn build(
 
         var process = std.process.Child.init(args, allocator);
 
-        log.debug("running `nix {s}`", .{lib.fmt.fmtJoin(" ", cli)});
+        log.debug("running `nix {s}`", .{utils.fmt.fmtJoin(" ", cli)});
         const term = try process.spawnAndWait();
         if (term != .Exited or term.Exited != 0) {
-            log.err("`nix {s}` failed: {}", .{ lib.fmt.fmtJoin(" ", cli), term });
+            log.err("`nix {s}` failed: {}", .{ utils.fmt.fmtJoin(" ", cli), term });
             return error.NixCopyTo;
         }
     }
@@ -392,10 +392,10 @@ fn build(
 
         var process = std.process.Child.init(args, allocator);
 
-        log.debug("running `nix {s}`", .{lib.fmt.fmtJoin(" ", cli)});
+        log.debug("running `nix {s}`", .{utils.fmt.fmtJoin(" ", cli)});
         const term = try process.spawnAndWait();
         if (term != .Exited or term.Exited != 0) {
-            log.err("`nix {s}` failed: {}", .{ lib.fmt.fmtJoin(" ", cli), term });
+            log.err("`nix {s}` failed: {}", .{ utils.fmt.fmtJoin(" ", cli), term });
             if (build_store[0] == std.fs.path.sep) log.warn(
                 \\{s} looks like a chroot store.
                 \\Please ensure I have read and execute permission on all parent directories.
@@ -410,11 +410,11 @@ fn build(
     {
         const args = &.{ "nix", "derivation", "show", installable.items };
 
-        log.debug("running `{s}`", .{lib.fmt.fmtJoin(" ", args)});
+        log.debug("running `{s}`", .{utils.fmt.fmtJoin(" ", args)});
         const result = try std.process.Child.run(.{
             .allocator = allocator,
             .argv = args,
-            .max_output_bytes = lib.mem.b_per_mib / 2,
+            .max_output_bytes = utils.mem.b_per_mib / 2,
         });
         defer {
             allocator.free(result.stdout);
@@ -422,14 +422,14 @@ fn build(
         }
 
         if (result.term != .Exited or result.term.Exited != 0) {
-            log.err("`{s}` failed: {}\nstdout: {s}\nstderr: {s}", .{ lib.fmt.fmtJoin(" ", args), result.term, result.stdout, result.stderr });
+            log.err("`{s}` failed: {}\nstdout: {s}\nstderr: {s}", .{ utils.fmt.fmtJoin(" ", args), result.term, result.stdout, result.stderr });
             return error.NixDerivationShow;
         }
 
         const parsed = std.json.parseFromSlice(std.json.ArrayHashMap(struct {
             outputs: std.json.ArrayHashMap(struct { path: []const u8 }),
         }), allocator, result.stdout, .{ .ignore_unknown_fields = true }) catch |err| {
-            log.err("{s}: failed to parse output of `{s}`\nstdout: {s}\nstderr: {s}", .{ @errorName(err), lib.fmt.fmtJoin(" ", args), result.stdout, result.stderr });
+            log.err("{s}: failed to parse output of `{s}`\nstdout: {s}\nstderr: {s}", .{ @errorName(err), utils.fmt.fmtJoin(" ", args), result.stdout, result.stderr });
             return err;
         };
         defer parsed.deinit();
@@ -484,7 +484,7 @@ fn build(
         }
 
         const format = "`{s}={s} nix {s}`";
-        const format_args = .{ key_nix_held_locks, env.get(key_nix_held_locks).?, lib.fmt.fmtJoin(" ", cli) };
+        const format_args = .{ key_nix_held_locks, env.get(key_nix_held_locks).?, utils.fmt.fmtJoin(" ", cli) };
 
         log.debug("running " ++ format, format_args);
         const term = try process.spawnAndWait();
@@ -512,7 +512,7 @@ fn nixCli(verbosity: nix.log.Action.Verbosity) []const []const u8 {
 }
 
 /// Returns an equivalent local fs store for the given local daemon store if possible.
-fn daemonStoreAsLocalStore(allocator: std.mem.Allocator, daemon_store: []const u8) (std.mem.Allocator.Error || lib.meta.ErrorSetExcluding(
+fn daemonStoreAsLocalStore(allocator: std.mem.Allocator, daemon_store: []const u8) (std.mem.Allocator.Error || utils.meta.ErrorSetExcluding(
     std.fs.Dir.AccessError,
     &.{ error.PermissionDenied, error.FileNotFound },
 ))!?[]const u8 {

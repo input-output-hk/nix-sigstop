@@ -1,8 +1,8 @@
 const std = @import("std");
 const known_folders = @import("known-folders");
-const lib = @import("lib");
+const utils = @import("utils");
 
-const nix = lib.nix;
+const nix = utils.nix;
 
 const hook = @import("hook.zig");
 
@@ -183,7 +183,7 @@ pub fn main() !u8 {
     };
     std.log.debug("upstream nix daemon socket: {s}", .{upstream_daemon_socket_path});
 
-    var proxy_daemon_socket_ctrl = lib.posix.ProxyDuplexControl.init(allocator);
+    var proxy_daemon_socket_ctrl = utils.posix.ProxyDuplexControl.init(allocator);
     defer proxy_daemon_socket_ctrl.deinit();
 
     var proxy_daemon_socket_thread: ?std.Thread = null;
@@ -209,7 +209,7 @@ pub fn main() !u8 {
     }
 
     proxy_daemon_socket_thread = try std.Thread.spawn(.{}, proxyDaemonSocket, .{ allocator, &daemon_server, upstream_daemon_socket_path, done_pipe_read, &proxy_daemon_socket_ctrl });
-    proxy_daemon_socket_thread.?.setName(lib.mem.capConst(u8, "daemon proxy", std.Thread.max_name_len, .end)) catch |err|
+    proxy_daemon_socket_thread.?.setName(utils.mem.capConst(u8, "daemon proxy", std.Thread.max_name_len, .end)) catch |err|
         std.log.debug("{s}: failed to set thread name", .{@errorName(err)});
 
     var nix_process = nix_process: {
@@ -254,7 +254,7 @@ pub fn main() !u8 {
     globals.wrapper = nix_process.id;
 
     process_events_thread = try std.Thread.spawn(.{}, processEvents, .{ allocator, fifo_path, done_pipe_read, nix_process.id, &proxy_daemon_socket_ctrl });
-    process_events_thread.?.setName(lib.mem.capConst(u8, "hook events", std.Thread.max_name_len, .end)) catch |err|
+    process_events_thread.?.setName(utils.mem.capConst(u8, "hook events", std.Thread.max_name_len, .end)) catch |err|
         std.log.debug("{s}: failed to set thread name", .{@errorName(err)});
 
     const term = try nix_process.wait();
@@ -268,8 +268,8 @@ pub fn main() !u8 {
     if (nix_process.resource_usage_statistics.getMaxRss()) |max_rss|
         std.log.info("max RSS: {d} bytes / {d:.2} MiB / {d:.2} GiB", .{
             max_rss,
-            @as(f32, @floatFromInt(max_rss)) / lib.mem.b_per_mib,
-            @as(f32, @floatFromInt(max_rss)) / lib.mem.b_per_gib,
+            @as(f32, @floatFromInt(max_rss)) / utils.mem.b_per_mib,
+            @as(f32, @floatFromInt(max_rss)) / utils.mem.b_per_gib,
         });
 
     return switch (term) {
@@ -286,7 +286,7 @@ fn processEvents(
     /// Will never have any data.
     done: std.fs.File,
     pid: std.process.Child.Id,
-    proxy_daemon_socket_ctrl: *lib.posix.ProxyDuplexControl,
+    proxy_daemon_socket_ctrl: *utils.posix.ProxyDuplexControl,
 ) !void {
     var num_building: u32 = 0;
 
@@ -377,7 +377,7 @@ fn proxyDaemonSocket(
     /// The nix command is done when the other end of this pipe is closed.
     /// Will never have any data.
     done: std.fs.File,
-    control: *lib.posix.ProxyDuplexControl,
+    control: *utils.posix.ProxyDuplexControl,
 ) !void {
     const posix = std.posix;
     const POLL = posix.POLL;
@@ -433,14 +433,14 @@ fn proxyDaemonSocket(
                     connection_: std.net.Server.Connection,
                     upstream_: std.net.Stream,
                     done_: std.fs.File,
-                    control_: *lib.posix.ProxyDuplexControl,
+                    control_: *utils.posix.ProxyDuplexControl,
                 ) void {
                     defer {
                         connection_.stream.close();
                         upstream_.close();
                     }
 
-                    const reason = @call(.auto, lib.posix.proxyDuplex, .{
+                    const reason = @call(.auto, utils.posix.proxyDuplex, .{
                         allocator_,
                         .{
                             .downstream_kind = .socket,
@@ -451,8 +451,8 @@ fn proxyDaemonSocket(
                         .{
                             .cancel = done_.handle,
                             .control = control_,
-                            .fifo_max_size = lib.mem.b_per_gib,
-                            .fifo_desired_size = 8 * lib.mem.b_per_mib,
+                            .fifo_max_size = utils.mem.b_per_gib,
+                            .fifo_desired_size = 8 * utils.mem.b_per_mib,
                         },
                     }) catch |err| {
                         std.log.err("{s}: error proxying nix client connection", .{@errorName(err)});
