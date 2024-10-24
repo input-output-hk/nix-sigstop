@@ -1,3 +1,4 @@
+const builtin = @import("builtin");
 const std = @import("std");
 const known_folders = @import("known-folders");
 const utils = @import("utils");
@@ -33,6 +34,18 @@ pub fn main() !u8 {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer if (gpa.deinit() == .leak) std.log.err("leaked memory", .{});
     const allocator = gpa.allocator();
+
+    if (!builtin.is_test) {
+        // we need the `nix store info` command for `nix.storeInfo()`
+        const min_nix_version = std.SemanticVersion{ .major = 2, .minor = 19, .patch = 0 };
+
+        const version = try nix.version(allocator);
+
+        if (version.order(min_nix_version) == .lt) {
+            std.log.err("nix version {} is too old, must be {} or newer", .{ version, min_nix_version });
+            return 1;
+        }
+    }
 
     if (build_hook: {
         var args = try std.process.argsWithAllocator(allocator);
