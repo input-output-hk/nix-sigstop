@@ -10,6 +10,8 @@ const log = utils.log.scoped(.hook);
 pub const Event = union(enum) {
     start: nix.build_hook.Derivation,
     /// the corresponding `start.drv_path`
+    heartbeat: []const u8,
+    /// the corresponding `start.drv_path`
     done: []const u8,
 
     fn emit(self: @This(), allocator: std.mem.Allocator, fifo: std.fs.File) (std.mem.Allocator.Error || std.fs.File.LockError || std.fs.File.WriteError)!void {
@@ -243,6 +245,25 @@ pub fn main(allocator: std.mem.Allocator, nix_config_env: nix.Config) !u8 {
 
     try (Event{ .start = drv }).emit(allocator, fifo);
 
+    var stop_heartbeat = std.Thread.ResetEvent{};
+    errdefer stop_heartbeat.set();
+
+    const heartbeat_thread = try std.Thread.spawn(.{}, struct {
+        fn heartbeat(
+            allocator_: std.mem.Allocator,
+            drv_path: []const u8,
+            fifo_: std.fs.File,
+            stop: *std.Thread.ResetEvent,
+        ) !void {
+            while (!stop.isSet())
+                stop.timedWait(5 * std.time.ns_per_s) catch
+                    (Event{ .heartbeat = drv_path }).emit(allocator_, fifo_) catch |err|
+                    std.debug.panic("{s}: failed to emit heartbeat event", .{@errorName(err)});
+        }
+    }.heartbeat, .{ allocator, drv.drv_path, fifo, &stop_heartbeat });
+    heartbeat_thread.setName(utils.mem.capConst(u8, "heartbeat", std.Thread.max_name_len, .end)) catch |err|
+        log.debug("{s}: failed to set thread name", .{@errorName(err)});
+
     const status = status: {
         log.debug("waiting for build hook to close its stderr", .{});
         // `hook_stderr_thread` polls and waits until
@@ -275,6 +296,9 @@ pub fn main(allocator: std.mem.Allocator, nix_config_env: nix.Config) !u8 {
 
         break :status 0;
     };
+
+    stop_heartbeat.set();
+    heartbeat_thread.join();
 
     (Event{ .done = drv.drv_path }).emit(allocator, fifo) catch |err| {
         _ = status catch |status_err|

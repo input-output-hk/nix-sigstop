@@ -301,7 +301,12 @@ fn processEvents(
     pid: std.process.Child.Id,
     proxy_daemon_socket_ctrl: *utils.posix.ProxyDuplexControl,
 ) !void {
-    var num_building: u32 = 0;
+    var building = std.StringArrayHashMap(std.time.Instant).init(allocator);
+    defer {
+        for (building.keys()) |drv_path|
+            allocator.free(drv_path);
+        building.deinit();
+    }
 
     std.log.debug("opening FIFO for IPC: {s}", .{fifo_path});
     const fifo = try std.fs.openFileAbsolute(fifo_path, .{
@@ -322,7 +327,9 @@ fn processEvents(
     // we already looked for the event end in.
     var fifo_readable_checked_len: usize = 0;
 
-    poll: while (try poller.poll()) {
+    poll: while (try poller.pollTimeout(5 * std.time.ns_per_s)) {
+        const some_building_before_events = building.count() != 0;
+
         while (true) {
             const fifo_readable = poller.fifo(.fifo).readableSlice(0);
 
@@ -336,27 +343,33 @@ fn processEvents(
                 defer event.deinit();
 
                 switch (event.value) {
-                    .start => |msg| {
-                        num_building += 1;
-                        std.log.info("build started: {s}", .{msg.drv_path});
+                    .start => |derivation| {
+                        {
+                            const drv_path = try allocator.dupe(u8, derivation.drv_path);
+                            errdefer allocator.free(drv_path);
+
+                            try building.putNoClobber(drv_path, try std.time.Instant.now());
+                        }
+
+                        std.log.info("build started: {s}", .{derivation.drv_path});
                     },
-                    .done => |msg| {
-                        num_building -= 1;
-                        std.log.info("build finished: {s}", .{msg});
+                    .heartbeat => |drv_path| {
+                        building.getPtr(drv_path).?.* = try std.time.Instant.now();
+
+                        std.log.debug("build heartbeat: {s}", .{drv_path});
+                        continue;
+                    },
+                    .done => |drv_path| {
+                        {
+                            const kv = building.fetchSwapRemove(drv_path).?;
+                            allocator.free(kv.key);
+                        }
+
+                        std.log.info("build finished: {s}", .{drv_path});
                     },
                 }
 
-                std.log.info("{d} builds running", .{num_building});
-
-                if (event.value == .start and num_building == 1) {
-                    std.log.info("stopping the nix client process", .{});
-                    try proxy_daemon_socket_ctrl.ignore(.downstream);
-                    try std.posix.kill(pid, std.posix.SIG.STOP);
-                } else if (num_building == 0) {
-                    std.log.info("continuing the nix client process", .{});
-                    try std.posix.kill(pid, std.posix.SIG.CONT);
-                    try proxy_daemon_socket_ctrl.unignore(.downstream);
-                }
+                std.log.info("{d} builds running", .{building.count()});
 
                 if (end_pos + 1 == fifo_readable.len)
                     // We have read the buffer to the end
@@ -366,6 +379,25 @@ fn processEvents(
                 fifo_readable_checked_len = fifo_readable.len;
                 break;
             }
+        }
+
+        if (!some_building_before_events and building.count() != 0) {
+            std.log.info("stopping the nix client process", .{});
+            try proxy_daemon_socket_ctrl.ignore(.downstream);
+            try std.posix.kill(pid, std.posix.SIG.STOP);
+        }
+        if (some_building_before_events and building.count() == 0 or heartbeat_timed_out: {
+            const now = try std.time.Instant.now();
+            var iter = building.iterator();
+            break :heartbeat_timed_out while (iter.next()) |kv| {
+                if (now.since(kv.value_ptr.*) <= 10 * std.time.ns_per_s) continue;
+                std.log.err("heartbeat timed out for build: {s}", .{kv.key_ptr.*});
+                break true;
+            } else false;
+        }) {
+            std.log.info("continuing the nix client process", .{});
+            try std.posix.kill(pid, std.posix.SIG.CONT);
+            try proxy_daemon_socket_ctrl.unignore(.downstream);
         }
 
         for (poller.poll_fds, std.enums.values(PollerStream)) |poll_fd, stream| {
