@@ -398,7 +398,7 @@ fn build(
             log.err("`nix {s}` failed: {}", .{ utils.fmt.fmtJoin(" ", cli), term });
             if (build_store[0] == std.fs.path.sep) log.warn(
                 \\{s} looks like a chroot store.
-                \\Please ensure I have read and execute permission on all parent directories.
+                \\Please ensure the nix build user has read and execute permission on all parent directories.
                 \\See https://github.com/NixOS/nixpkgs/pull/90431 for more information.
             , .{build_store});
             return error.NixBuild;
