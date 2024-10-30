@@ -396,19 +396,42 @@ fn processEvents(
             } else false;
         }) {
             std.log.info("continuing the nix client process", .{});
-            try std.posix.kill(pid, std.posix.SIG.CONT);
+            std.posix.kill(pid, std.posix.SIG.CONT) catch |err| switch (err) {
+                error.ProcessNotFound => {
+                    // A heartbeat may time out
+                    // shortly after the nix client process terminates
+                    // but before we are notified of that via `done`.
+                },
+                else => |e| return e,
+            };
             try proxy_daemon_socket_ctrl.unignore(.downstream);
         }
 
         for (poller.poll_fds, std.enums.values(PollerStream)) |poll_fd, stream| {
             switch (stream) {
                 .fifo => {},
-                .done => if (poll_fd.revents & std.posix.POLL.HUP == std.posix.POLL.HUP)
+                .done => if (poll_fd.revents & std.posix.POLL.HUP != 0)
                     break :poll,
             }
 
             if (poll_fd.fd == -1) {
                 std.log.err("error polling `{}`. revents: 0x{X}", .{ stream, poll_fd.revents });
+
+                if (stream == .done) {
+                    // Continue the nix client process in case it is currently stopped
+                    // because we are about to shut down this thread and do not want
+                    // to leave it in a stopped state forever.
+                    std.posix.kill(pid, std.posix.SIG.CONT) catch |err| switch (err) {
+                        error.ProcessNotFound => {
+                            // We have no way to tell whether
+                            // the nix client process is running
+                            // because our `done` pipe is broken.
+                        },
+                        else => |e| return e,
+                    };
+                    try proxy_daemon_socket_ctrl.unignore(.downstream);
+                }
+
                 break :poll;
             }
         }
