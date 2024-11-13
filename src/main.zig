@@ -390,7 +390,7 @@ fn processEvents(
             var iter = building.iterator();
             break :heartbeat_timed_out while (iter.next()) |kv| {
                 if (now.since(kv.value_ptr.*) <= 20 * std.time.ns_per_s) continue;
-                std.log.err("heartbeat timed out for build: {s}", .{kv.key_ptr.*});
+                std.log.warn("heartbeat timed out for build: {s}", .{kv.key_ptr.*});
                 break true;
             } else false;
         }) {
