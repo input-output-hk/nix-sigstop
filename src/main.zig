@@ -357,7 +357,6 @@ fn processEvents(
                         building.getPtr(drv_path).?.* = try std.time.Instant.now();
 
                         std.log.debug("build heartbeat: {s}", .{drv_path});
-                        continue;
                     },
                     .done => |drv_path| {
                         {
