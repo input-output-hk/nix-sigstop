@@ -328,7 +328,7 @@ fn processEvents(
     var fifo_readable_checked_len: usize = 0;
 
     poll: while (try poller.pollTimeout(5 * std.time.ns_per_s)) {
-        const some_building_before_events = building.count() != 0;
+        const building_before_events = building.count();
 
         while (true) {
             const fifo_readable = poller.fifo(.fifo).readableSlice(0);
@@ -368,8 +368,6 @@ fn processEvents(
                     },
                 }
 
-                std.log.info("{d} builds running", .{building.count()});
-
                 if (end_pos + 1 == fifo_readable.len)
                     // We have read the buffer to the end
                     // so we need to poll for new data.
@@ -380,12 +378,12 @@ fn processEvents(
             }
         }
 
-        if (!some_building_before_events and building.count() != 0) {
+        if (building_before_events == 0 and building.count() != 0) {
             std.log.info("stopping the nix client process", .{});
             try proxy_daemon_socket_ctrl.ignore(.downstream);
             try std.posix.kill(pid, std.posix.SIG.STOP);
         }
-        if (some_building_before_events and building.count() == 0 or heartbeat_timed_out: {
+        if (building_before_events != 0 and building.count() == 0 or heartbeat_timed_out: {
             var heartbeat_timed_out = false;
 
             const now = try std.time.Instant.now();
@@ -419,6 +417,9 @@ fn processEvents(
             };
             try proxy_daemon_socket_ctrl.unignore(.downstream);
         }
+
+        if (building.count() != building_before_events)
+            std.log.info("{d} builds running", .{building.count()});
 
         for (poller.poll_fds, std.enums.values(PollerStream)) |poll_fd, stream| {
             switch (stream) {
