@@ -386,13 +386,27 @@ fn processEvents(
             try std.posix.kill(pid, std.posix.SIG.STOP);
         }
         if (some_building_before_events and building.count() == 0 or heartbeat_timed_out: {
+            var heartbeat_timed_out = false;
+
             const now = try std.time.Instant.now();
-            var iter = building.iterator();
-            break :heartbeat_timed_out while (iter.next()) |kv| {
-                if (now.since(kv.value_ptr.*) <= 20 * std.time.ns_per_s) continue;
-                std.log.warn("heartbeat timed out for build: {s}", .{kv.key_ptr.*});
-                break true;
-            } else false;
+            var building_idx: usize = 0;
+            while (building_idx < building.count()) {
+                const drv_path = building.keys()[building_idx];
+                const last_heartbeat = building.values()[building_idx];
+
+                if (now.since(last_heartbeat) <= 20 * std.time.ns_per_s) {
+                    building_idx += 1;
+                    continue;
+                }
+
+                heartbeat_timed_out = true;
+                std.log.warn("heartbeat timed out for build: {s}", .{drv_path});
+
+                building.swapRemoveAt(building_idx);
+                allocator.free(drv_path);
+            }
+
+            break :heartbeat_timed_out heartbeat_timed_out;
         }) {
             std.log.info("continuing the nix client process", .{});
             std.posix.kill(pid, std.posix.SIG.CONT) catch |err| switch (err) {
