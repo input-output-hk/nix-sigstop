@@ -254,11 +254,14 @@ pub fn main(allocator: std.mem.Allocator, nix_config_env: nix.Config) !u8 {
             drv_path: []const u8,
             fifo_: std.fs.File,
             stop: *std.Thread.ResetEvent,
-        ) !void {
-            while (!stop.isSet())
-                stop.timedWait(5 * std.time.ns_per_s) catch
-                    (Event{ .heartbeat = drv_path }).emit(allocator_, fifo_) catch |err|
-                    std.debug.panic("{s}: failed to emit heartbeat event", .{@errorName(err)});
+        ) void {
+            while (true)
+                if (stop.timedWait(5 * std.time.ns_per_s))
+                    break
+                else |timeout_err| switch (timeout_err) {
+                    error.Timeout => (Event{ .heartbeat = drv_path }).emit(allocator_, fifo_) catch |err|
+                        std.debug.panic("{s}: failed to emit heartbeat event", .{@errorName(err)}),
+                };
         }
     }.heartbeat, .{ allocator, drv.drv_path, fifo, &stop_heartbeat });
     heartbeat_thread.setName(utils.mem.capConst(u8, "heartbeat", std.Thread.max_name_len, .end)) catch |err|
