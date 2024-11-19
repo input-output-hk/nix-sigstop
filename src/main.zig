@@ -344,28 +344,23 @@ fn processEvents(
 
                 switch (event.value) {
                     .start => |derivation| {
+                        std.log.info("build started: {s}", .{derivation.drv_path});
+
                         {
                             const drv_path = try allocator.dupe(u8, derivation.drv_path);
                             errdefer allocator.free(drv_path);
 
                             try building.putNoClobber(drv_path, try std.time.Instant.now());
                         }
-
-                        std.log.info("build started: {s}", .{derivation.drv_path});
                     },
-                    .heartbeat => |drv_path| {
-                        building.getPtr(drv_path).?.* = try std.time.Instant.now();
-
+                    .heartbeat => |drv_path| if (building.getPtr(drv_path)) |ptr| {
                         std.log.debug("build heartbeat: {s}", .{drv_path});
-                    },
-                    .done => |drv_path| {
-                        {
-                            const kv = building.fetchSwapRemove(drv_path).?;
-                            allocator.free(kv.key);
-                        }
-
+                        ptr.* = try std.time.Instant.now();
+                    } else std.log.warn("unknown build heartbeat (possibly timed out already): {s}", .{drv_path}),
+                    .done => |drv_path| if (building.fetchSwapRemove(drv_path)) |kv| {
                         std.log.info("build finished: {s}", .{drv_path});
-                    },
+                        allocator.free(kv.key);
+                    } else std.log.warn("unknown build finished (possibly timed out already): {s}", .{drv_path}),
                 }
 
                 if (end_pos + 1 == fifo_readable.len)
