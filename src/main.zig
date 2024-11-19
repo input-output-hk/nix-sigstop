@@ -387,7 +387,9 @@ fn processEvents(
                 const drv_path = building.keys()[building_idx];
                 const last_heartbeat = building.values()[building_idx];
 
-                if (now.since(last_heartbeat) <= 20 * std.time.ns_per_s) {
+                if (now.order(last_heartbeat) == .lt or // ensure monotonicity
+                    now.since(last_heartbeat) <= 30 * std.time.ns_per_s)
+                {
                     building_idx += 1;
                     continue;
                 }
