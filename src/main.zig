@@ -351,7 +351,7 @@ fn processEvents(
     // we already looked for the event end in.
     var fifo_readable_checked_len: usize = 0;
 
-    poll: while (try poller.pollTimeout(5 * std.time.ns_per_s)) {
+    poll: while (try poller.poll()) {
         const num_building_before_events = num_building;
 
         while (true) {
