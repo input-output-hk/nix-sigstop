@@ -25,16 +25,7 @@ pub fn main(allocator: std.mem.Allocator) !u8 {
     std.debug.assert(args.skip());
     std.debug.assert(args.skip());
 
-    var fifo = fifo: {
-        const fifo_path = args.next().?;
-        log.debug("opening FIFO for IPC: {s}", .{fifo_path});
-        break :fifo std.fs.openFileAbsolute(fifo_path, .{ .mode = .write_only }) catch |err| {
-            log.err("{s}: failed to open path to FIFO for IPC: {s}", .{ @errorName(err), fifo_path });
-            return err;
-        };
-    };
-    defer fifo.close();
-
+    const fifo_path = args.next().?;
     const drv_path = args.next().?;
 
     while (args.next()) |wanted_output| {
@@ -50,6 +41,13 @@ pub fn main(allocator: std.mem.Allocator) !u8 {
             else => |e| return e,
         }
     }
+
+    log.debug("opening FIFO for IPC: {s}", .{fifo_path});
+    var fifo = std.fs.openFileAbsolute(fifo_path, .{ .mode = .write_only }) catch |err| {
+        log.err("{s}: failed to open path to FIFO for IPC: {s}", .{ @errorName(err), fifo_path });
+        return err;
+    };
+    defer fifo.close();
 
     try (root.Event{ .done = drv_path }).emit(allocator, fifo, log.scope);
 
