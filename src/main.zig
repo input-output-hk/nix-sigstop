@@ -6,6 +6,7 @@ const utils = @import("utils");
 const nix = utils.nix;
 
 const hook = @import("hook.zig");
+const notifier = @import("notifier.zig");
 
 pub const std_options = .{
     .log_scope_levels = &.{
@@ -15,49 +16,77 @@ pub const std_options = .{
     .logFn = struct {
         fn logFn(comptime message_level: std.log.Level, comptime scope: @Type(.EnumLiteral), comptime format: []const u8, args: anytype) void {
             switch (globals) {
-                .wrapper => std.log.defaultLog(message_level, scope, format, args),
+                .wrapper, .build_notifier => std.log.defaultLog(message_level, scope, format, args),
                 .build_hook => nix.log.logFn(message_level, scope, format, args),
             }
         }
     }.logFn,
 };
 
-const hook_arg = "__build-hook";
+pub const Event = union(enum) {
+    start: nix.build_hook.Derivation,
+    /// the corresponding `start.drv_path`
+    done: []const u8,
+
+    pub fn emit(
+        self: @This(),
+        allocator: std.mem.Allocator,
+        fifo: std.fs.File,
+        comptime log_scope: @TypeOf(.EnumLiteral),
+    ) (std.mem.Allocator.Error || std.fs.File.LockError || std.fs.File.WriteError)!void {
+        const log = utils.log.scoped(log_scope);
+
+        try fifo.lock(.exclusive);
+        defer fifo.unlock();
+
+        const fifo_writer = fifo.writer();
+
+        if (log.scopeLogEnabled(.debug)) {
+            const json = try std.json.stringifyAlloc(allocator, self, .{});
+            defer allocator.free(json);
+
+            log.debug("emitting IPC event: {s}", .{json});
+
+            try fifo_writer.writeAll(json);
+        } else try std.json.stringify(self, .{}, fifo_writer);
+
+        try fifo_writer.writeByte('\n');
+    }
+};
+
+pub const hook_arg = "__build-hook";
+pub const notifier_arg = "__build-notifier";
 
 var globals: union(enum) {
     /// The PID of the nix client process.
     wrapper: ?std.process.Child.Id,
     build_hook,
+    build_notifier,
 } = .{ .wrapper = null };
 
 pub fn main() !u8 {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){
+        .backing_allocator = std.heap.c_allocator,
+    };
     defer if (gpa.deinit() == .leak) std.log.err("leaked memory", .{});
     const allocator = gpa.allocator();
 
-    if (!builtin.is_test) {
-        // we need the `nix store info` command for `nix.storeInfo()`
-        const min_nix_version = std.SemanticVersion{ .major = 2, .minor = 19, .patch = 0 };
-
-        const version = try nix.version(allocator);
-
-        if (version.order(min_nix_version) == .lt) {
-            std.log.err("nix version {} is too old, must be {} or newer", .{ version, min_nix_version });
-            return 1;
-        }
-    }
-
-    if (build_hook: {
+    {
         var args = try std.process.argsWithAllocator(allocator);
         defer args.deinit();
 
         std.debug.assert(args.skip());
 
-        break :build_hook if (args.next()) |arg1|
-            std.mem.eql(u8, arg1, hook_arg)
-        else
-            false;
-    }) globals = .build_hook;
+        if (args.next()) |arg1| {
+            if (std.mem.eql(u8, arg1, hook_arg))
+                globals = .build_hook
+            else if (std.mem.eql(u8, arg1, notifier_arg))
+                globals = .build_notifier;
+        }
+    }
+
+    if (globals == .build_notifier)
+        return notifier.main(allocator);
 
     std.log.debug("reading nix config from environment", .{});
     const nix_config_env = nix_config_env: {
@@ -73,7 +102,23 @@ pub fn main() !u8 {
     };
     defer nix_config_env.deinit();
 
-    if (globals == .build_hook) return hook.main(allocator, nix_config_env.value);
+    switch (globals) {
+        .wrapper => {},
+        .build_hook => return hook.main(allocator, nix_config_env.value),
+        .build_notifier => unreachable,
+    }
+
+    if (!builtin.is_test) {
+        // we need the `nix store info` command for `nix.storeInfo()`
+        const min_nix_version = std.SemanticVersion{ .major = 2, .minor = 19, .patch = 0 };
+
+        const version = try nix.version(allocator);
+
+        if (version.order(min_nix_version) == .lt) {
+            std.log.err("nix version {} is too old, must be {} or newer", .{ version, min_nix_version });
+            return 1;
+        }
+    }
 
     {
         const sa = std.posix.Sigaction{
@@ -116,15 +161,6 @@ pub fn main() !u8 {
         return error.NoDataDir;
     };
     defer allocator.free(state_dir_path);
-
-    const cache_dir_path = if (try known_folders.getPath(allocator, .cache)) |known_folder_path| cache_dir_path: {
-        defer allocator.free(known_folder_path);
-        break :cache_dir_path try std.fs.path.join(allocator, &.{ known_folder_path, "nix-sigstop" });
-    } else {
-        std.log.err("no cache folder available", .{});
-        return error.NoCacheDir;
-    };
-    defer allocator.free(cache_dir_path);
 
     try std.fs.cwd().makePath(state_dir_path);
 
@@ -230,7 +266,7 @@ pub fn main() !u8 {
         defer allocator.free(store_arg);
 
         const build_hook_arg = try std.mem.concat(allocator, u8, &.{
-            if (std.fs.path.isAbsolute(args[0])) args[0] else self_exe: {
+            self_exe: {
                 var self_exe_buf: [std.fs.MAX_PATH_BYTES]u8 = undefined;
                 break :self_exe try std.fs.selfExePath(&self_exe_buf);
             },
@@ -239,19 +275,12 @@ pub fn main() !u8 {
         });
         defer allocator.free(build_hook_arg);
 
-        const builders_arg = try std.mem.join(allocator, &.{std.fs.path.delimiter}, &.{
-            fifo_path,
-            cache_dir_path,
-            target_store_info.value.url,
-        });
-        defer allocator.free(builders_arg);
-
         const nix_args = try std.mem.concat(allocator, []const u8, &.{
             &.{"nix"},
             &.{
                 "--store",      store_arg,
                 "--build-hook", build_hook_arg,
-                "--builders",   builders_arg,
+                "--builders",   fifo_path,
             },
             args[1..],
         });
@@ -301,12 +330,7 @@ fn processEvents(
     pid: std.process.Child.Id,
     proxy_daemon_socket_ctrl: *utils.posix.ProxyDuplexControl,
 ) !void {
-    var building = std.StringArrayHashMap(std.time.Instant).init(allocator);
-    defer {
-        for (building.keys()) |drv_path|
-            allocator.free(drv_path);
-        building.deinit();
-    }
+    var num_building: usize = 0;
 
     std.log.debug("opening FIFO for IPC: {s}", .{fifo_path});
     const fifo = try std.fs.openFileAbsolute(fifo_path, .{
@@ -328,7 +352,7 @@ fn processEvents(
     var fifo_readable_checked_len: usize = 0;
 
     poll: while (try poller.pollTimeout(5 * std.time.ns_per_s)) {
-        const building_before_events = building.count();
+        const num_building_before_events = num_building;
 
         while (true) {
             const fifo_readable = poller.fifo(.fifo).readableSlice(0);
@@ -339,28 +363,18 @@ fn processEvents(
                 var fifo_json_reader = std.json.reader(allocator, std.io.limitedReader(poller.fifo(.fifo).reader(), end_pos + 1));
                 defer fifo_json_reader.deinit();
 
-                const event = try std.json.parseFromTokenSource(hook.Event, allocator, &fifo_json_reader, .{});
+                const event = try std.json.parseFromTokenSource(Event, allocator, &fifo_json_reader, .{});
                 defer event.deinit();
 
                 switch (event.value) {
-                    .start => |derivation| {
-                        std.log.info("build started: {s}", .{derivation.drv_path});
-
-                        {
-                            const drv_path = try allocator.dupe(u8, derivation.drv_path);
-                            errdefer allocator.free(drv_path);
-
-                            try building.putNoClobber(drv_path, try std.time.Instant.now());
-                        }
+                    .start => |drv| {
+                        std.log.info("build started: {s}", .{drv.drv_path});
+                        num_building += 1;
                     },
-                    .heartbeat => |drv_path| if (building.getPtr(drv_path)) |ptr| {
-                        std.log.debug("build heartbeat: {s}", .{drv_path});
-                        ptr.* = try std.time.Instant.now();
-                    } else std.log.warn("unknown build heartbeat (possibly timed out already): {s}", .{drv_path}),
-                    .done => |drv_path| if (building.fetchSwapRemove(drv_path)) |kv| {
-                        std.log.info("build finished: {s}", .{drv_path});
-                        allocator.free(kv.key);
-                    } else std.log.warn("unknown build finished (possibly timed out already): {s}", .{drv_path}),
+                    .done => |drv_path| {
+                        std.log.info("build done: {s}", .{drv_path});
+                        num_building -= 1;
+                    },
                 }
 
                 if (end_pos + 1 == fifo_readable.len)
@@ -373,50 +387,19 @@ fn processEvents(
             }
         }
 
-        if (building_before_events == 0 and building.count() != 0) {
+        if (num_building_before_events == 0 and num_building != 0) {
             std.log.info("stopping the nix client process", .{});
             try proxy_daemon_socket_ctrl.ignore(.downstream);
             try std.posix.kill(pid, std.posix.SIG.STOP);
         }
-        if (building_before_events != 0 and building.count() == 0 or heartbeat_timed_out: {
-            var heartbeat_timed_out = false;
-
-            const now = try std.time.Instant.now();
-            var building_idx: usize = 0;
-            while (building_idx < building.count()) {
-                const drv_path = building.keys()[building_idx];
-                const last_heartbeat = building.values()[building_idx];
-
-                if (now.order(last_heartbeat) == .lt or // ensure monotonicity
-                    now.since(last_heartbeat) <= 30 * std.time.ns_per_s)
-                {
-                    building_idx += 1;
-                    continue;
-                }
-
-                heartbeat_timed_out = true;
-                std.log.warn("heartbeat timed out for build: {s}", .{drv_path});
-
-                building.swapRemoveAt(building_idx);
-                allocator.free(drv_path);
-            }
-
-            break :heartbeat_timed_out heartbeat_timed_out;
-        }) {
+        if (num_building_before_events != 0 and num_building == 0) {
             std.log.info("continuing the nix client process", .{});
-            std.posix.kill(pid, std.posix.SIG.CONT) catch |err| switch (err) {
-                error.ProcessNotFound => {
-                    // A heartbeat may time out
-                    // shortly after the nix client process terminates
-                    // but before we are notified of that via `done`.
-                },
-                else => |e| return e,
-            };
+            try std.posix.kill(pid, std.posix.SIG.CONT);
             try proxy_daemon_socket_ctrl.unignore(.downstream);
         }
 
-        if (building.count() != building_before_events)
-            std.log.info("{d} builds running", .{building.count()});
+        if (num_building != num_building_before_events)
+            std.log.info("{d} builds running", .{num_building});
 
         for (poller.poll_fds, std.enums.values(PollerStream)) |poll_fd, stream| {
             switch (stream) {

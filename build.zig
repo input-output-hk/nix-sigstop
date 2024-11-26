@@ -15,6 +15,7 @@ pub fn build(b: *std.Build) !void {
         .optimize = opts.optimize,
     });
     addDependencyImports(b, &exe.root_module, opts);
+    linkSystemLibraries(&exe.root_module);
     b.installArtifact(exe);
 
     const run_step = b.step("run", "Run the app");
@@ -34,6 +35,7 @@ pub fn build(b: *std.Build) !void {
             .optimize = opts.optimize,
         });
         addDependencyImports(b, &exe_test.root_module, opts);
+        linkSystemLibraries(&exe_test.root_module);
 
         const run_exe_test = b.addRunArtifact(exe_test);
         test_step.dependOn(&run_exe_test.step);
@@ -42,7 +44,14 @@ pub fn build(b: *std.Build) !void {
     _ = utils.addCheckTls(b);
 }
 
-fn addDependencyImports(b: *std.Build, module: *std.Build.Module, opts: anytype) void {
+fn addDependencyImports(b: *std.Build, module: *std.Build.Module, opts: struct {
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+}) void {
     module.addImport("utils", b.dependency("utils", opts).module("utils"));
     module.addImport("known-folders", b.dependency("known-folders", opts).module("known-folders"));
+}
+
+fn linkSystemLibraries(module: *std.Build.Module) void {
+    module.link_libc = true;
 }
