@@ -543,7 +543,7 @@ fn proxyDaemonSocket(
             }.work, .{ allocator, connection, upstream, done, control });
         }
 
-        if (poll_fds[1].revents & POLL.HUP == POLL.HUP)
+        if (poll_fds[1].revents & POLL.HUP != 0)
             break;
 
         inline for (poll_fds, .{ "nix daemon server", "done pipe" }) |poll_fd, name|
