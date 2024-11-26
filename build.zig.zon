@@ -7,8 +7,8 @@
             .hash = "12205f5e7505c96573f6fc5144592ec38942fb0a326d692f9cddc0c7dd38f9028f29",
         },
         .utils = .{
-            .url = "https://github.com/dermetfan/utils.zig/archive/0bfc4212c925b397c1660f94bffe83be132753e6.tar.gz",
-            .hash = "122025cb208f8bc488a03b6cc6f3c8ec56cadfab99fc080de8167c355746d8c926db",
+            .url = "https://github.com/dermetfan/utils.zig/archive/082fd8b6f9743adc6aaab4d2599efba318f9f92e.tar.gz",
+            .hash = "1220414cc4106af75c65ef50001136118a9056ed5eaa70ed23214ee749e253a686c2",
         },
     },
     .paths = .{

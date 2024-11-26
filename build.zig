@@ -42,7 +42,10 @@ pub fn build(b: *std.Build) !void {
     _ = utils.addCheckTls(b);
 }
 
-fn addDependencyImports(b: *std.Build, module: *std.Build.Module, opts: anytype) void {
+fn addDependencyImports(b: *std.Build, module: *std.Build.Module, opts: struct {
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+}) void {
     module.addImport("utils", b.dependency("utils", opts).module("utils"));
     module.addImport("known-folders", b.dependency("known-folders", opts).module("known-folders"));
 }

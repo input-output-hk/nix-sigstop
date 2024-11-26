@@ -5,33 +5,9 @@ const utils = @import("utils");
 const nix = utils.nix;
 const posix = utils.posix;
 
+const root = if (builtin.is_test) @import("main.zig") else @import("root");
+
 const log = utils.log.scoped(.hook);
-
-pub const Event = union(enum) {
-    start: nix.build_hook.Derivation,
-    /// the corresponding `start.drv_path`
-    heartbeat: []const u8,
-    /// the corresponding `start.drv_path`
-    done: []const u8,
-
-    fn emit(self: @This(), allocator: std.mem.Allocator, fifo: std.fs.File) (std.mem.Allocator.Error || std.fs.File.LockError || std.fs.File.WriteError)!void {
-        try fifo.lock(.exclusive);
-        defer fifo.unlock();
-
-        const fifo_writer = fifo.writer();
-
-        if (log.scopeLogEnabled(.debug)) {
-            const json = try std.json.stringifyAlloc(allocator, self, .{});
-            defer allocator.free(json);
-
-            log.debug("emitting IPC event: {s}", .{json});
-
-            try fifo_writer.writeAll(json);
-        } else try std.json.stringify(self, .{}, fifo_writer);
-
-        try fifo_writer.writeByte('\n');
-    }
-};
 
 pub fn main(allocator: std.mem.Allocator, nix_config_env: nix.Config) !u8 {
     const verbosity = verbosity: {
@@ -61,14 +37,13 @@ pub fn main(allocator: std.mem.Allocator, nix_config_env: nix.Config) !u8 {
         log.debug("nix config:\n{s}", .{nix_config_msg.items});
     }
 
-    var fifo, const build_store, const target_store = builders: {
+    const fifo_path, const store = builders: {
         const builders = nix_config.get("builders").?;
 
-        const fifo_path, const build_store, const target_store = iter: {
+        const fifo_path, const store = iter: {
             var builders_iter = std.mem.splitScalar(u8, builders, std.fs.path.delimiter);
             defer if (std.debug.runtime_safety) std.debug.assert(builders_iter.next() == null);
             break :iter .{
-                builders_iter.next() orelse break :iter error.NoBuilders,
                 builders_iter.next() orelse break :iter error.NoBuilders,
                 builders_iter.next() orelse break :iter error.NoBuilders,
             };
@@ -91,34 +66,30 @@ pub fn main(allocator: std.mem.Allocator, nix_config_env: nix.Config) !u8 {
             return error.AccessDenied;
         }
 
-        if (build_store.len == 0) {
-            log.err("expected a store for building locally in nix config entry `builders` but it is empty", .{});
-            return error.NoBuilders;
-        }
-
-        log.debug("opening FIFO for IPC", .{});
         break :builders .{
-            std.fs.openFileAbsolute(fifo_path, .{ .mode = .write_only }) catch |err| {
-                log.err("{s}: failed to open path to FIFO for IPC: {s}", .{ @errorName(err), fifo_path });
-                return err;
-            },
-            try allocator.dupe(u8, build_store),
-            try allocator.dupe(u8, target_store),
+            try allocator.dupe(u8, fifo_path),
+            try allocator.dupe(u8, store),
         };
     };
     defer {
-        fifo.close();
-        allocator.free(build_store);
-        allocator.free(target_store);
+        allocator.free(fifo_path);
+        allocator.free(store);
     }
 
-    // `NIX_HELD_LOCKS` only has an effect on local fs stores.
-    const local_target_store = if (isLocalStore(target_store)) null else try daemonStoreAsLocalStore(allocator, target_store);
-    defer if (local_target_store) |lts| allocator.free(lts);
+    log.debug("opening FIFO for IPC", .{});
+    var fifo = std.fs.openFileAbsolute(fifo_path, .{ .mode = .write_only }) catch |err| {
+        log.err("{s}: failed to open path to FIFO for IPC: {s}", .{ @errorName(err), fifo_path });
+        return err;
+    };
+    defer fifo.close();
 
-    if (local_target_store) |lts| log.info(
+    // `NIX_HELD_LOCKS` only has an effect on local fs stores.
+    const local_store = if (isLocalStore(store)) null else try daemonStoreAsLocalStore(allocator, store);
+    defer if (local_store) |ls| allocator.free(ls);
+
+    if (local_store) |ls| log.info(
         "assuming store `{s}` to effectively be the same as current store `{s}`",
-        .{ lts, target_store },
+        .{ ls, store },
     );
 
     var hook_process = hook_process: {
@@ -185,7 +156,7 @@ pub fn main(allocator: std.mem.Allocator, nix_config_env: nix.Config) !u8 {
         try nix_config.put("builders", nix_config_env.builders.value);
         // If the build hook accepts, we need it to copy into a local fs store
         // because `NIX_HELD_LOCKS` only works on local fs stores.
-        try nix_config.put("store", local_target_store orelse target_store);
+        try nix_config.put("store", local_store orelse store);
 
         nix_config.hash_map.lockPointers();
         defer nix_config.hash_map.unlockPointers();
@@ -194,10 +165,10 @@ pub fn main(allocator: std.mem.Allocator, nix_config_env: nix.Config) !u8 {
         try (nix.build_hook.Initialization{ .nix_config = nix_config }).write(hook_stdin_writer);
     }
 
-    const drv, const build_io, const accepted = accept: while (true) {
+    const drv_path = accept: while (true) {
         log.debug("reading derivation request", .{});
         const drv = try connection.readDerivation(allocator);
-        errdefer drv.deinit(allocator);
+        defer drv.deinit(allocator);
 
         log.debug("requesting build from build hook: {s}", .{drv.drv_path});
         try (nix.build_hook.Request{ .derivation = drv }).write(hook_stdin_writer);
@@ -209,108 +180,125 @@ pub fn main(allocator: std.mem.Allocator, nix_config_env: nix.Config) !u8 {
         log.debug("build hook responded with \"{s}\"", .{@tagName(std.meta.activeTag(hook_response))});
 
         switch (hook_response) {
-            .postpone => {
-                try connection.postpone();
-
-                drv.deinit(allocator);
-            },
-            .accept => |remote_store| {
-                log.debug("building remotely in {s}", .{remote_store});
-
-                const build_io = try connection.accept(allocator, remote_store);
-                errdefer build_io.deinit(allocator);
-
-                try nix.wire.writeStruct(nix.build_hook.BuildIo, hook_stdin_writer, build_io);
-
-                break :accept .{ drv, build_io, true };
-            },
+            .postpone => try connection.postpone(),
             .decline, .decline_permanently => {
                 // XXX Cache `decline_permanently` so that we don't have
                 // to ask the build hook for the remaining derivations.
 
-                log.debug("building locally in {s}", .{build_store});
+                const drv_show_result = result: {
+                    const args = try std.mem.concat(allocator, []const u8, &.{
+                        nixCli(verbosity),
+                        &.{
+                            "derivation",
+                            "show",
+                            drv.drv_path,
+                        },
+                    });
+                    defer allocator.free(args);
 
-                break :accept .{
-                    drv,
-                    try connection.accept(allocator, build_store),
-                    false,
+                    break :result try std.process.Child.run(.{
+                        .allocator = allocator,
+                        .argv = args,
+                    });
                 };
+                defer {
+                    allocator.free(drv_show_result.stdout);
+                    allocator.free(drv_show_result.stderr);
+                }
+
+                if (drv_show_result.term != .Exited or drv_show_result.term.Exited != 0) {
+                    log.err("`nix derivation show {s}` terminated with {}", .{ drv.drv_path, drv_show_result.term });
+                    return switch (drv_show_result.term) {
+                        .Exited => |code| code,
+                        else => 1,
+                    };
+                }
+
+                // TODO parse into `std.json.ArrayHashMap` instead
+                const drv_show_parsed = try std.json.parseFromSlice(std.json.Value, allocator, drv_show_result.stdout, .{});
+                defer drv_show_parsed.deinit();
+
+                const outputs_info = drv_show_parsed.value.object.get(drv.drv_path).?.object
+                    .get("outputs").?.object;
+
+                var outputs = std.ArrayListUnmanaged([]const u8){};
+                defer outputs.deinit(allocator);
+
+                try outputs.ensureUnusedCapacity(allocator, outputs_info.count());
+                for (outputs_info.values()) |output_info|
+                    outputs.appendAssumeCapacity(output_info.object.get("path").?.string);
+
+                try (root.Event{ .start = drv }).emit(allocator, fifo, log.scope);
+
+                {
+                    const args = try std.mem.concat(allocator, []const u8, &.{
+                        &.{
+                            self_exe: {
+                                var self_exe_buf: [std.fs.MAX_PATH_BYTES]u8 = undefined;
+                                break :self_exe try std.fs.selfExePath(&self_exe_buf);
+                            },
+                            root.notifier_arg,
+                            fifo_path,
+                            drv.drv_path,
+                        },
+                        outputs.items,
+                    });
+                    defer allocator.free(args);
+
+                    var process = std.process.Child.init(args, allocator);
+                    process.stdin_behavior = .Close;
+                    process.stdout_behavior = .Close;
+                    process.stderr_behavior = .Close;
+
+                    const term = try process.spawnAndWait();
+                    if (term != .Exited or term.Exited != 0) {
+                        log.err("failed to spawn build notifier process, terminated with {}", .{term});
+                        return error.BuildNotifier;
+                    }
+                }
+
+                try connection.decline();
+            },
+            .accept => |remote_store| {
+                const build_io = try connection.accept(allocator, remote_store);
+                defer build_io.deinit(allocator);
+
+                try nix.wire.writeStruct(nix.build_hook.BuildIo, hook_stdin_writer, build_io);
+
+                try (root.Event{ .start = drv }).emit(allocator, fifo, log.scope);
+
+                break :accept try allocator.dupe(u8, drv.drv_path);
             },
         }
     };
-    defer {
-        drv.deinit(allocator);
-        build_io.deinit(allocator);
-    }
+    defer allocator.free(drv_path);
 
-    try (Event{ .start = drv }).emit(allocator, fifo);
+    log.debug("waiting for build hook to close its stderr", .{});
+    // `hook_stderr_thread` polls and waits until
+    // `hook_process` closes the write end of its stderr pipe.
+    // We must wait for that before calling `hook_process.wait()`
+    // because that closes the read end of the stderr pipe
+    // and we must not do that while `hook_stderr_thread` is still using it.
+    hook_stderr_thread.?.join();
 
-    var stop_heartbeat = std.Thread.ResetEvent{};
-    errdefer stop_heartbeat.set();
+    log.debug("waiting for build hook to exit", .{});
+    const status = if (hook_process.wait()) |term| switch (term) {
+        .Exited => |code| code: {
+            if (code != 0)
+                log.info("build hook exited with {d}", .{code});
+            break :code code;
+        },
+        else => 1,
+    } else |err| err;
 
-    const heartbeat_thread = try std.Thread.spawn(.{}, struct {
-        fn heartbeat(
-            allocator_: std.mem.Allocator,
-            drv_path: []const u8,
-            fifo_: std.fs.File,
-            stop: *std.Thread.ResetEvent,
-        ) void {
-            while (true)
-                if (stop.timedWait(5 * std.time.ns_per_s))
-                    break
-                else |timeout_err| switch (timeout_err) {
-                    error.Timeout => (Event{ .heartbeat = drv_path }).emit(allocator_, fifo_) catch |err|
-                        std.debug.panic("{s}: failed to emit heartbeat event", .{@errorName(err)}),
-                };
-        }
-    }.heartbeat, .{ allocator, drv.drv_path, fifo, &stop_heartbeat });
-    heartbeat_thread.setName(utils.mem.capConst(u8, "heartbeat", std.Thread.max_name_len, .end)) catch |err|
-        log.debug("{s}: failed to set thread name", .{@errorName(err)});
-
-    const status = status: {
-        log.debug("waiting for build hook to close its stderr", .{});
-        // `hook_stderr_thread` polls and waits until
-        // `hook_process` closes the write end of its stderr pipe.
-        // We must wait for that before calling `hook_process.wait()`
-        // because that closes the read end of the stderr pipe
-        // and we must not do that while `hook_stderr_thread` is still using it.
-        hook_stderr_thread.?.join();
-
-        log.debug("waiting for build hook to exit", .{});
-        if (hook_process.wait()) |term| {
-            if (term != .Exited or term.Exited != 0) {
-                log.info("build hook terminated with {}", .{term});
-                break :status switch (term) {
-                    .Exited => |code| code,
-                    else => 1,
-                };
-            }
-        } else |err| break :status err;
-
-        if (!accepted) build(
-            allocator,
-            drv.drv_path,
-            build_io.wanted_outputs,
-            build_store,
-            target_store,
-            local_target_store,
-            verbosity,
-        ) catch |err| break :status err;
-
-        break :status 0;
-    };
-
-    stop_heartbeat.set();
-    heartbeat_thread.join();
-
-    (Event{ .done = drv.drv_path }).emit(allocator, fifo) catch |err| {
+    (root.Event{ .done = drv_path }).emit(allocator, fifo, log.scope) catch |err| {
         _ = status catch |status_err|
-            log.err("{s}: failed to handle final hook response", .{@errorName(status_err)});
+            log.err("{s}: failed to await build hook", .{@errorName(status_err)});
 
         // XXX Should be able to just `return err` but it seems that fails peer type resolution.
         // Could this be a compiler bug? This only happens if we have an `errdefer` with capture
         // in the enclosing block. In our case this is the `errdefer` that kills `hook_process`.
-        return @as(utils.meta.FnErrorSet(@TypeOf(Event.emit))!u8, err);
+        return @as(utils.meta.FnErrorSet(@TypeOf(root.Event.emit))!u8, err);
     };
 
     return status;
@@ -359,169 +347,6 @@ fn processHookStderr(stderr_reader: anytype, protocol_writer: anytype) !void {
     log.debug("build hook closed stderr", .{});
 }
 
-fn build(
-    allocator: std.mem.Allocator,
-    drv_path: []const u8,
-    outputs: []const []const u8,
-    build_store: []const u8,
-    target_store: []const u8,
-    local_target_store: ?[]const u8,
-    verbosity: nix.log.Action.Verbosity,
-) !void {
-    var installable = std.ArrayList(u8).init(allocator);
-    defer installable.deinit();
-
-    try installable.appendSlice(drv_path);
-    try installable.append('^');
-    for (outputs, 0..) |output, idx| {
-        if (idx != 0) try installable.append(',');
-        try installable.appendSlice(output);
-    }
-
-    log.info("building {s}", .{installable.items});
-
-    {
-        const cli = &.{
-            "copy",
-            "--no-check-sigs",
-            "--from",
-            target_store,
-            "--to",
-            build_store,
-            drv_path,
-        };
-
-        const args = try std.mem.concat(allocator, []const u8, &.{ nixCli(verbosity), cli });
-        defer allocator.free(args);
-
-        var process = std.process.Child.init(args, allocator);
-
-        log.debug("running `nix {s}`", .{utils.fmt.fmtJoin(" ", cli)});
-        const term = try process.spawnAndWait();
-        if (term != .Exited or term.Exited != 0) {
-            log.err("`nix {s}` failed: {}", .{ utils.fmt.fmtJoin(" ", cli), term });
-            return error.NixCopyTo;
-        }
-    }
-
-    {
-        const cli = &.{
-            "build",
-            "--no-link",
-            "--print-build-logs",
-            "--store",
-            build_store,
-            installable.items,
-        };
-
-        const args = try std.mem.concat(allocator, []const u8, &.{ nixCli(verbosity), cli });
-        defer allocator.free(args);
-
-        var process = std.process.Child.init(args, allocator);
-
-        log.debug("running `nix {s}`", .{utils.fmt.fmtJoin(" ", cli)});
-        const term = try process.spawnAndWait();
-        if (term != .Exited or term.Exited != 0) {
-            log.err("`nix {s}` failed: {}", .{ utils.fmt.fmtJoin(" ", cli), term });
-            if (build_store[0] == std.fs.path.sep) log.warn(
-                \\{s} looks like a chroot store.
-                \\Please ensure the nix build user has read and execute permission on all parent directories.
-                \\See https://github.com/NixOS/nixpkgs/pull/90431 for more information.
-            , .{build_store});
-            return error.NixBuild;
-        }
-    }
-
-    var output_paths = std.BufSet.init(allocator);
-    defer output_paths.deinit();
-    {
-        const args = &.{ "nix", "derivation", "show", installable.items };
-
-        log.debug("running `{s}`", .{utils.fmt.fmtJoin(" ", args)});
-        const result = try std.process.Child.run(.{
-            .allocator = allocator,
-            .argv = args,
-            .max_output_bytes = utils.mem.b_per_mib / 2,
-        });
-        defer {
-            allocator.free(result.stdout);
-            allocator.free(result.stderr);
-        }
-
-        if (result.term != .Exited or result.term.Exited != 0) {
-            log.err("`{s}` failed: {}\nstdout: {s}\nstderr: {s}", .{ utils.fmt.fmtJoin(" ", args), result.term, result.stdout, result.stderr });
-            return error.NixDerivationShow;
-        }
-
-        const parsed = std.json.parseFromSlice(std.json.ArrayHashMap(struct {
-            outputs: std.json.ArrayHashMap(struct { path: []const u8 }),
-        }), allocator, result.stdout, .{ .ignore_unknown_fields = true }) catch |err| {
-            log.err("{s}: failed to parse output of `{s}`\nstdout: {s}\nstderr: {s}", .{ @errorName(err), utils.fmt.fmtJoin(" ", args), result.stdout, result.stderr });
-            return err;
-        };
-        defer parsed.deinit();
-
-        for (parsed.value.map.values()) |drv_info|
-            for (drv_info.outputs.map.values()) |output|
-                try output_paths.insert(output.path);
-    }
-
-    {
-        const cli = &.{
-            "copy",
-            "--no-check-sigs",
-            "--from",
-            build_store,
-            "--to",
-            // `NIX_HELD_LOCKS` only has an effect on the `nix copy` command with local fs stores.
-            local_target_store orelse target_store,
-            installable.items, // XXX pass `output_paths` instead as that may be less work for Nix to figure out the actual store paths from the installable
-        };
-
-        const args = try std.mem.concat(allocator, []const u8, &.{ nixCli(verbosity), cli });
-        defer allocator.free(args);
-
-        var process = std.process.Child.init(args, allocator);
-
-        const key_nix_held_locks = "NIX_HELD_LOCKS";
-
-        var env = try std.process.getEnvMap(allocator);
-        defer env.deinit();
-        process.env_map = &env;
-        {
-            const key = try allocator.dupe(u8, key_nix_held_locks);
-            errdefer allocator.free(key);
-
-            var value = std.ArrayList(u8).init(allocator);
-            errdefer value.deinit();
-            {
-                var iter = output_paths.iterator();
-                var first = true;
-                while (iter.next()) |output_path| {
-                    if (first)
-                        first = false
-                    else
-                        try value.append(':');
-
-                    try value.appendSlice(output_path.*);
-                }
-            }
-
-            try env.putMove(key, try value.toOwnedSlice());
-        }
-
-        const format = "`{s}={s} nix {s}`";
-        const format_args = .{ key_nix_held_locks, env.get(key_nix_held_locks).?, utils.fmt.fmtJoin(" ", cli) };
-
-        log.debug("running " ++ format, format_args);
-        const term = try process.spawnAndWait();
-        if (term != .Exited or term.Exited != 0) {
-            log.err(format ++ " failed: {}", format_args ++ .{term});
-            return error.NixCopyFrom;
-        }
-    }
-}
-
 fn nixCli(verbosity: nix.log.Action.Verbosity) []const []const u8 {
     const head = .{
         "nix",
@@ -547,7 +372,7 @@ fn daemonStoreAsLocalStore(allocator: std.mem.Allocator, daemon_store: []const u
     defer arena.deinit();
     const arena_allocator = arena.allocator();
 
-    const state, const store = local: {
+    const state_dir, const store = local: {
         const uri = std.Uri.parse(daemon_store) catch |err| switch (err) {
             error.UnexpectedCharacter, error.InvalidFormat => std.Uri.parseAfterScheme("", daemon_store) catch return null,
             error.InvalidPort => return null,
@@ -566,8 +391,8 @@ fn daemonStoreAsLocalStore(allocator: std.mem.Allocator, daemon_store: []const u
         else
             null;
 
-        var state: []const u8 = "/nix/var/nix";
-        var root: []const u8 = "/";
+        var state_dir: []const u8 = "/nix/var/nix";
+        var root_dir: []const u8 = "/";
 
         if (uri_query) |query| {
             var uri_query_iter = std.mem.tokenizeScalar(u8, query, '&');
@@ -578,9 +403,9 @@ fn daemonStoreAsLocalStore(allocator: std.mem.Allocator, daemon_store: []const u
                 const param_value = param_iter.next();
 
                 if (std.mem.eql(u8, param_name, "state"))
-                    state = param_value orelse return null
+                    state_dir = param_value orelse return null
                 else if (std.mem.eql(u8, param_name, "root"))
-                    root = param_value orelse return null
+                    root_dir = param_value orelse return null
                 else
                     continue;
 
@@ -589,13 +414,13 @@ fn daemonStoreAsLocalStore(allocator: std.mem.Allocator, daemon_store: []const u
         }
 
         break :local .{
-            try std.fs.path.join(arena_allocator, &.{ root, state }),
+            try std.fs.path.join(arena_allocator, &.{ root_dir, state_dir }),
             if (uri_query) |query| try std.mem.concat(arena_allocator, u8, &.{ "local?", query }) else "local",
         };
     };
 
     // According to `nix help-stores`, `auto` only checks the state directory for write permission.
-    if (!builtin.is_test) std.fs.accessAbsolute(state, .{ .mode = .write_only }) catch |err| return switch (err) {
+    if (!builtin.is_test) std.fs.accessAbsolute(state_dir, .{ .mode = .write_only }) catch |err| return switch (err) {
         error.PermissionDenied, error.FileNotFound => null,
         else => |e| e,
     };
