@@ -126,7 +126,7 @@ pub fn main(allocator: std.mem.Allocator, nix_config_env: nix.Config) !u8 {
         try (nix.build_hook.Initialization{ .nix_config = nix_config }).write(hook_stdin_writer);
     }
 
-    while (true) {
+    const accepted, const drv_path = accept: while (true) {
         log.debug("reading derivation request", .{});
         const drv = try connection.readDerivation(allocator);
         defer drv.deinit(allocator);
@@ -196,7 +196,34 @@ pub fn main(allocator: std.mem.Allocator, nix_config_env: nix.Config) !u8 {
                 }
 
                 try (root.Event{ .start = drv }).emit(allocator, fifo, log.scope);
-                try spawnBuildNotifier(allocator, fifo_path, drv.drv_path, outputs.items);
+
+                {
+                    const args = try std.mem.concat(allocator, []const u8, &.{
+                        &.{
+                            self_exe: {
+                                var self_exe_buf: [std.fs.MAX_PATH_BYTES]u8 = undefined;
+                                break :self_exe try std.fs.selfExePath(&self_exe_buf);
+                            },
+                            root.notifier_arg,
+                            fifo_path,
+                            drv.drv_path,
+                        },
+                        outputs.items,
+                    });
+                    defer allocator.free(args);
+
+                    var process = std.process.Child.init(args, allocator);
+                    process.stdin_behavior = .Close;
+                    process.stdout_behavior = .Close;
+                    process.stderr_behavior = .Ignore;
+
+                    log.debug("spawning build notifier process for {s}", .{drv.drv_path});
+                    const term = try process.spawnAndWait();
+                    if (term != .Exited or term.Exited != 0) {
+                        log.err("failed to spawn build notifier process, terminated with {}", .{term});
+                        return error.BuildNotifier;
+                    }
+                }
 
                 try connection.decline();
             },
@@ -207,12 +234,12 @@ pub fn main(allocator: std.mem.Allocator, nix_config_env: nix.Config) !u8 {
                 try nix.wire.writeStruct(nix.build_hook.BuildIo, hook_stdin_writer, build_io);
 
                 try (root.Event{ .start = drv }).emit(allocator, fifo, log.scope);
-                try spawnBuildNotifier(allocator, fifo_path, drv.drv_path, build_io.wanted_outputs);
 
-                break;
+                break :accept .{ true, try allocator.dupe(u8, drv.drv_path) };
             },
         }
-    }
+    };
+    defer allocator.free(drv_path);
 
     log.debug("waiting for build hook to close its stderr", .{});
     // `hook_stderr_thread` polls and waits until
@@ -231,6 +258,9 @@ pub fn main(allocator: std.mem.Allocator, nix_config_env: nix.Config) !u8 {
             else => 1,
         };
     }
+
+    if (accepted)
+        try (root.Event{ .done = drv_path }).emit(allocator, fifo, log.scope);
 
     return 0;
 }
@@ -276,34 +306,6 @@ fn processHookStderr(stderr_reader: anytype, protocol_writer: anytype) !void {
     }
 
     log.debug("build hook closed stderr", .{});
-}
-
-fn spawnBuildNotifier(allocator: std.mem.Allocator, fifo_path: []const u8, drv_path: []const u8, wanted_outputs: []const []const u8) !void {
-    const args = try std.mem.concat(allocator, []const u8, &.{
-        &.{
-            self_exe: {
-                var self_exe_buf: [std.fs.MAX_PATH_BYTES]u8 = undefined;
-                break :self_exe try std.fs.selfExePath(&self_exe_buf);
-            },
-            root.notifier_arg,
-            fifo_path,
-            drv_path,
-        },
-        wanted_outputs,
-    });
-    defer allocator.free(args);
-
-    var process = std.process.Child.init(args, allocator);
-    process.stdin_behavior = .Close;
-    process.stdout_behavior = .Close;
-    process.stderr_behavior = .Ignore;
-
-    log.debug("spawning build notifier process for {s}", .{drv_path});
-    const term = try process.spawnAndWait();
-    if (term != .Exited or term.Exited != 0) {
-        log.err("failed to spawn build notifier process, terminated with {}", .{term});
-        return error.BuildNotifier;
-    }
 }
 
 fn nixCli(verbosity: nix.log.Action.Verbosity) []const []const u8 {
