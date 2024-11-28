@@ -494,7 +494,7 @@ fn proxyDaemonSocket(
         if (poll_fds[0].revents & POLL.IN != 0) {
             const connection = server.accept() catch |err| switch (err) {
                 error.SocketNotListening, error.ConnectionAborted => break,
-                else => return err,
+                else => |e| return e,
             };
             errdefer connection.stream.close();
 
