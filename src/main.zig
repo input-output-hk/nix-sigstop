@@ -248,12 +248,12 @@ pub fn main() !u8 {
 
         const nix_args = try std.mem.concat(allocator, []const u8, &.{
             &.{"nix"},
+            args[1..],
             &.{
                 "--store",      store_arg,
                 "--build-hook", build_hook_arg,
                 "--builders",   builders_arg,
             },
-            args[1..],
         });
         defer allocator.free(nix_args);
 
