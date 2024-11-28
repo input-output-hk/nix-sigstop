@@ -188,7 +188,7 @@ pub fn main() !u8 {
         break :upstream_daemon_socket_path if (std.mem.eql(u8, store, "daemon") or std.mem.startsWith(u8, store, "daemon?"))
             "/nix/var/nix/daemon-socket/socket"
         else if (std.mem.startsWith(u8, store, "unix://"))
-            store["unix://".len .. std.mem.indexOfScalar(u8, store, '?') orelse store.len]
+            store[0 .. std.mem.indexOfScalarPos(u8, store, "unix://".len, '?') orelse store.len]
         else {
             std.log.err("nix-sigstop only works with local daemon stores which the current store is not: {s}", .{store});
             return 1;
