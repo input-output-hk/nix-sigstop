@@ -177,7 +177,7 @@ pub fn main(allocator: std.mem.Allocator, nix_config_env: nix.Config) !u8 {
         const hook_response = try nix.build_hook.Response.read(allocator, hook_response_pipe_read.reader());
         defer hook_response.deinit(allocator);
 
-        log.debug("build hook responded with \"{s}\"", .{@tagName(std.meta.activeTag(hook_response))});
+        log.debug("build hook responded with \"{s}\"", .{@tagName(hook_response)});
 
         switch (hook_response) {
             .postpone => try connection.postpone(),
