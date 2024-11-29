@@ -166,7 +166,7 @@ pub fn main() !u8 {
     const pid_str = pid_str: {
         // see `PID_MAX_LIMIT` in `man 5 proc`
         var pid_str_buf: [std.fmt.comptimePrint("{d}", .{std.math.maxInt(u22)}).len]u8 = undefined;
-        break :pid_str pid_str_buf[0..std.fmt.formatIntBuf(&pid_str_buf, std.os.linux.getpid(), 10, .lower, .{})];
+        break :pid_str pid_str_buf[0..std.fmt.formatIntBuf(&pid_str_buf, std.posix.system.getpid(), 10, .lower, .{})];
     };
 
     const fifo_path = try std.mem.concatWithSentinel(allocator, u8, &.{
@@ -177,7 +177,7 @@ pub fn main() !u8 {
     }, 0);
     defer allocator.free(fifo_path);
 
-    if (std.os.linux.mknod(fifo_path, std.os.linux.S.IFIFO | 0o622, 0) != 0) return error.Mknod;
+    if (std.posix.system.mknod(fifo_path, std.posix.system.S.IFIFO | 0o622, 0) != 0) return error.Mknod;
     defer std.posix.unlink(fifo_path) catch |err|
         std.log.err("{s}: failed to delete FIFO: {s}", .{ @errorName(err), fifo_path });
 
