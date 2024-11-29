@@ -6,7 +6,6 @@ const utils = @import("utils");
 const nix = utils.nix;
 
 const hook = @import("hook.zig");
-const notifier = @import("notifier.zig");
 
 pub const std_options = .{
     .log_scope_levels = &.{
@@ -29,36 +28,20 @@ pub const Event = union(enum) {
     /// the corresponding `start.drv_path`
     done: []const u8,
 
-    pub fn emit(
-        self: @This(),
-        allocator: std.mem.Allocator,
-        fifo: std.fs.File,
-        comptime log_scope: @TypeOf(.EnumLiteral),
-    ) (std.mem.Allocator.Error || std.fs.File.LockError || std.fs.File.WriteError)!void {
-        const log = utils.log.scoped(log_scope);
-
+    pub fn emit(self: @This(), fifo: std.fs.File) (std.fs.File.LockError || std.fs.File.WriteError)!void {
         try fifo.lock(.exclusive);
         defer fifo.unlock();
 
         const fifo_writer = fifo.writer();
 
-        if (log.scopeLogEnabled(.debug)) {
-            const json = try std.json.stringifyAlloc(allocator, self, .{});
-            defer allocator.free(json);
-
-            log.debug("emitting IPC event: {s}", .{json});
-
-            try fifo_writer.writeAll(json);
-        } else try std.json.stringify(self, .{}, fifo_writer);
-
+        try std.json.stringify(self, .{}, fifo_writer);
         try fifo_writer.writeByte('\n');
     }
 };
 
 pub const hook_arg = "__build-hook";
-pub const notifier_arg = "__build-notifier";
 
-var globals: union(enum) {
+pub var globals: union(enum) {
     /// The PID of the nix client process.
     wrapper: ?std.process.Child.Id,
     build_hook,
@@ -78,14 +61,9 @@ pub fn main() !u8 {
 
         if (args.next()) |arg1| {
             if (std.mem.eql(u8, arg1, hook_arg))
-                globals = .build_hook
-            else if (std.mem.eql(u8, arg1, notifier_arg))
-                globals = .build_notifier;
+                globals = .build_hook;
         }
     }
-
-    if (globals == .build_notifier)
-        return notifier.main(allocator);
 
     std.log.debug("reading nix config from environment", .{});
     const nix_config_env = nix_config_env: {

@@ -7,9 +7,40 @@ const posix = utils.posix;
 
 const root = if (builtin.is_test) @import("main.zig") else @import("root");
 
+const notifier = @import("notifier.zig");
+
 const log = utils.log.scoped(.hook);
 
 pub fn main(allocator: std.mem.Allocator, nix_config_env: nix.Config) !u8 {
+    return switch (try hook(allocator, nix_config_env)) {
+        .exit => |status| status,
+        .notify => |args| notify: {
+            defer {
+                for (args.output_lockfile_paths) |output_lockfile_path|
+                    allocator.free(output_lockfile_path);
+                allocator.free(args.output_lockfile_paths);
+
+                allocator.free(args.drv_path);
+
+                args.fifo.close();
+            }
+
+            notifier.main(args.fifo, args.drv_path, args.output_lockfile_paths);
+
+            break :notify 0;
+        },
+    };
+}
+
+const NotifierArgs = utils.meta.NamedArgs(
+    @TypeOf(notifier.main),
+    &.{ "fifo", "drv_path", "output_lockfile_paths" },
+);
+
+fn hook(allocator: std.mem.Allocator, nix_config_env: nix.Config) !union(enum) {
+    exit: u8,
+    notify: NotifierArgs,
+} {
     const verbosity = verbosity: {
         var args = try std.process.argsWithAllocator(allocator);
         defer args.deinit();
@@ -165,7 +196,7 @@ pub fn main(allocator: std.mem.Allocator, nix_config_env: nix.Config) !u8 {
         try (nix.build_hook.Initialization{ .nix_config = nix_config }).write(hook_stdin_writer);
     }
 
-    const drv_path = accept: while (true) {
+    while (true) {
         log.debug("reading derivation request", .{});
         const drv = try connection.readDerivation(allocator);
         defer drv.deinit(allocator);
@@ -181,89 +212,14 @@ pub fn main(allocator: std.mem.Allocator, nix_config_env: nix.Config) !u8 {
 
         switch (hook_response) {
             .postpone => try connection.postpone(),
-            .decline, .decline_permanently => {
-                // XXX Cache `decline_permanently` so that we don't have
-                // to ask the build hook for the remaining derivations.
-
-                const drv_show_result = result: {
-                    const args = try std.mem.concat(allocator, []const u8, &.{
-                        nixCli(verbosity),
-                        &.{
-                            "derivation",
-                            "show",
-                            drv.drv_path,
-                        },
-                    });
-                    defer allocator.free(args);
-
-                    break :result try std.process.Child.run(.{
-                        .allocator = allocator,
-                        .argv = args,
-                    });
-                };
-                defer {
-                    allocator.free(drv_show_result.stdout);
-                    allocator.free(drv_show_result.stderr);
-                }
-
-                if (drv_show_result.term != .Exited or drv_show_result.term.Exited != 0) {
-                    log.err("`nix derivation show {s}` terminated with {}", .{ drv.drv_path, drv_show_result.term });
-                    return switch (drv_show_result.term) {
-                        .Exited => |code| code,
-                        else => 1,
-                    };
-                }
-
-                const drv_show_parsed = try std.json.parseFromSlice(std.json.ArrayHashMap(struct {
-                    outputs: std.json.ArrayHashMap(struct {
-                        path: []const u8,
-                    }),
-                }), allocator, drv_show_result.stdout, .{
-                    .ignore_unknown_fields = true,
-                });
-                defer drv_show_parsed.deinit();
-
-                std.debug.assert(drv_show_parsed.value.map.count() == 1);
-                const outputs_info = drv_show_parsed.value.map.get(drv.drv_path).?
-                    .outputs.map;
-
-                var outputs = std.ArrayListUnmanaged([]const u8){};
-                defer outputs.deinit(allocator);
-
-                try outputs.ensureUnusedCapacity(allocator, outputs_info.count());
-                for (outputs_info.values()) |output_info|
-                    outputs.appendAssumeCapacity(output_info.path);
-
-                try (root.Event{ .start = drv }).emit(allocator, fifo, log.scope);
-
-                {
-                    const args = try std.mem.concat(allocator, []const u8, &.{
-                        &.{
-                            self_exe: {
-                                var self_exe_buf: [std.fs.MAX_PATH_BYTES]u8 = undefined;
-                                break :self_exe try std.fs.selfExePath(&self_exe_buf);
-                            },
-                            root.notifier_arg,
-                            fifo_path,
-                            drv.drv_path,
-                        },
-                        outputs.items,
-                    });
-                    defer allocator.free(args);
-
-                    var process = std.process.Child.init(args, allocator);
-                    process.stdin_behavior = .Close;
-                    process.stdout_behavior = .Close;
-                    process.stderr_behavior = .Close;
-
-                    const term = try process.spawnAndWait();
-                    if (term != .Exited or term.Exited != 0) {
-                        log.err("failed to spawn build notifier process, terminated with {}", .{term});
-                        return error.BuildNotifier;
-                    }
-                }
-
-                try connection.decline();
+            // XXX Cache `decline_permanently` so that we don't have
+            // to ask the build hook for the remaining derivations.
+            .decline, .decline_permanently => switch (try daemonizeToBecomeBuildNotifier(allocator, verbosity, fifo, drv, null)) {
+                .exit => |caller| switch (caller) {
+                    .parent => try connection.decline(),
+                    .intermediate => return .{ .exit = 0 },
+                },
+                .notify => |notify| return .{ .notify = notify },
             },
             .accept => |remote_store| {
                 const build_io = try connection.accept(allocator, remote_store);
@@ -271,13 +227,20 @@ pub fn main(allocator: std.mem.Allocator, nix_config_env: nix.Config) !u8 {
 
                 try nix.wire.writeStruct(nix.build_hook.BuildIo, hook_stdin_writer, build_io);
 
-                try (root.Event{ .start = drv }).emit(allocator, fifo, log.scope);
-
-                break :accept try allocator.dupe(u8, drv.drv_path);
+                switch (try daemonizeToBecomeBuildNotifier(allocator, verbosity, fifo, drv, build_io.wanted_outputs)) {
+                    .exit => |caller| switch (caller) {
+                        .parent => break,
+                        .intermediate =>
+                        // It is important that the intermediate returns
+                        // so that it does not attempt to join `hook_stderr_thread`
+                        // which the first parent is already doing, leading to a deadlock!
+                        return .{ .exit = 0 },
+                    },
+                    .notify => |notify| return .{ .notify = notify },
+                }
             },
         }
-    };
-    defer allocator.free(drv_path);
+    }
 
     log.debug("waiting for build hook to close its stderr", .{});
     // `hook_stderr_thread` polls and waits until
@@ -287,27 +250,24 @@ pub fn main(allocator: std.mem.Allocator, nix_config_env: nix.Config) !u8 {
     // and we must not do that while `hook_stderr_thread` is still using it.
     hook_stderr_thread.?.join();
 
-    log.debug("waiting for build hook to exit", .{});
-    const status = if (hook_process.wait()) |term| switch (term) {
-        .Exited => |code| code: {
-            if (code != 0)
-                log.info("build hook exited with {d}", .{code});
-            break :code code;
+    return .{
+        .exit = exit: {
+            log.debug("waiting for build hook to exit", .{});
+            const term = try hook_process.wait();
+            break :exit if (term != .Exited or term.Exited != 0) status: {
+                log.info(
+                    "build hook terminated: {s} {d}",
+                    .{
+                        @tagName(term),
+                        switch (term) {
+                            inline else => |code| code,
+                        },
+                    },
+                );
+                break :status 1;
+            } else term.Exited;
         },
-        else => 1,
-    } else |err| err;
-
-    (root.Event{ .done = drv_path }).emit(allocator, fifo, log.scope) catch |err| {
-        _ = status catch |status_err|
-            log.err("{s}: failed to await build hook", .{@errorName(status_err)});
-
-        // XXX Should be able to just `return err` but it seems that fails peer type resolution.
-        // Could this be a compiler bug? This only happens if we have an `errdefer` with capture
-        // in the enclosing block. In our case this is the `errdefer` that kills `hook_process`.
-        return @as(utils.meta.FnErrorSet(@TypeOf(root.Event.emit))!u8, err);
     };
-
-    return status;
 }
 
 fn processHookStderr(stderr_reader: anytype, protocol_writer: anytype) !void {
@@ -353,20 +313,156 @@ fn processHookStderr(stderr_reader: anytype, protocol_writer: anytype) !void {
     log.debug("build hook closed stderr", .{});
 }
 
+const DaemonizeParent = utils.enums.Sub(
+    @typeInfo(utils.meta.FnErrorUnionPayload(@TypeOf(posix.daemonize))).Union.tag_type.?,
+    &.{ .parent, .intermediate },
+);
+
+/// Prepares arguments needed for `notifier.main()` and forks off a daemon.
+/// Returns null if the caller is the parent or
+/// returns the notifier arguments if the caller is the daemon.
+/// The parent likely wants to exit cleanly by returning from main
+/// so all its deferred blocks are run to release all resources.
+fn daemonizeToBecomeBuildNotifier(
+    allocator: std.mem.Allocator,
+    verbosity: nix.log.Action.Verbosity,
+    fifo: std.fs.File,
+    drv: nix.build_hook.Derivation,
+    wanted_outputs: ?[]const []const u8,
+) !union(enum) {
+    exit: DaemonizeParent,
+    notify: NotifierArgs,
+} {
+    return switch (posix.daemonize() catch |err| {
+        log.err("{s}: failed to daemonize", .{@errorName(err)});
+        // XXX Should be able to just `return err` but it seems that fails peer type resolution.
+        // Could this be a compiler bug? This only happens if we have an `errdefer` with capture
+        // in the enclosing block. In our case this is the `errdefer` that sends the done event.
+        return @as(utils.meta.FnErrorSet(@TypeOf(posix.daemonize))!utils.meta.FnErrorUnionPayload(@TypeOf(daemonizeToBecomeBuildNotifier)), err);
+    }) {
+        inline else => |_, tag| .{ .exit = std.enums.nameCast(DaemonizeParent, tag) },
+        .daemon => daemon: {
+            // We're about to close stdio as daemons should
+            // but first let's do all allocations and fallible calls
+            // in case we want to log an error.
+
+            try (root.Event{ .start = drv }).emit(fifo);
+            errdefer |err| (root.Event{ .done = drv.drv_path }).emit(fifo) catch |emit_err|
+                log.err("{s}: failed to emit done event on error: {s}", .{ @errorName(emit_err), @errorName(err) });
+
+            const output_lockfile_paths = try derivationOutputLockfilePaths(allocator, verbosity, drv.drv_path, wanted_outputs);
+            errdefer {
+                for (output_lockfile_paths) |output_lockfile_path|
+                    allocator.free(output_lockfile_path);
+                allocator.free(output_lockfile_paths);
+            }
+
+            const fifo_dup = std.fs.File{ .handle = try std.posix.dup(fifo.handle) };
+            errdefer fifo_dup.close();
+
+            const drv_path = try allocator.dupe(u8, drv.drv_path);
+            errdefer allocator.free(drv_path);
+
+            errdefer comptime unreachable;
+
+            root.globals = .build_notifier;
+
+            std.io.getStdIn().close();
+            std.io.getStdOut().close();
+            std.io.getStdErr().close();
+
+            break :daemon .{ .notify = .{
+                .fifo = fifo_dup,
+                .drv_path = drv_path,
+                .output_lockfile_paths = output_lockfile_paths,
+            } };
+        },
+    };
+}
+
+fn derivationOutputLockfilePaths(
+    allocator: std.mem.Allocator,
+    verbosity: nix.log.Action.Verbosity,
+    drv_path: []const u8,
+    wanted_outputs: ?[]const []const u8,
+) ![]const []const u8 {
+    const drv_show_result = result: {
+        const args = try std.mem.concat(allocator, []const u8, &.{
+            nixCli(verbosity),
+            &.{
+                "derivation",
+                "show",
+                drv_path,
+            },
+        });
+        defer allocator.free(args);
+
+        break :result try std.process.Child.run(.{
+            .allocator = allocator,
+            .argv = args,
+        });
+    };
+    defer {
+        allocator.free(drv_show_result.stdout);
+        allocator.free(drv_show_result.stderr);
+    }
+
+    if (drv_show_result.term != .Exited or drv_show_result.term.Exited != 0) {
+        log.err("`nix derivation show {s}` terminated with {}", .{ drv_path, drv_show_result.term });
+        return error.NixDerivationShow;
+    }
+
+    const drv_show_parsed = try std.json.parseFromSlice(std.json.ArrayHashMap(struct {
+        outputs: std.json.ArrayHashMap(struct {
+            path: []const u8,
+        }),
+    }), allocator, drv_show_result.stdout, .{
+        .ignore_unknown_fields = true,
+    });
+    defer drv_show_parsed.deinit();
+
+    std.debug.assert(drv_show_parsed.value.map.count() == 1);
+    const outputs_info = drv_show_parsed.value.map.get(drv_path).?
+        .outputs.map;
+
+    var output_lockfile_paths = try std.ArrayListUnmanaged([]const u8).initCapacity(
+        allocator,
+        if (wanted_outputs) |w_os|
+            w_os.len
+        else
+            outputs_info.count(),
+    );
+    errdefer {
+        for (output_lockfile_paths.items) |output_lockfile_path|
+            allocator.free(output_lockfile_path);
+        output_lockfile_paths.deinit(allocator);
+    }
+
+    if (wanted_outputs) |w_os| {
+        for (w_os) |wanted_output| {
+            const output_lockfile_path = try std.mem.concat(allocator, u8, &.{ outputs_info.get(wanted_output).?.path, ".lock" });
+            errdefer allocator.free(output_lockfile_path);
+
+            output_lockfile_paths.appendAssumeCapacity(output_lockfile_path);
+        }
+    } else for (outputs_info.values()) |output_info| {
+        const output_lockfile_path = try std.mem.concat(allocator, u8, &.{ output_info.path, ".lock" });
+        errdefer allocator.free(output_lockfile_path);
+
+        output_lockfile_paths.appendAssumeCapacity(output_lockfile_path);
+    }
+
+    return output_lockfile_paths.toOwnedSlice(allocator);
+}
+
 fn nixCli(verbosity: nix.log.Action.Verbosity) []const []const u8 {
-    const head = .{
+    return verbosity.comptimeCli(true, .{
         "nix",
         "--extra-experimental-features",
         "nix-command",
         "--log-format",
         "internal-json",
-    };
-    return switch (@intFromEnum(verbosity)) {
-        0 => &(head ++ .{"--quiet"} ** 2),
-        1 => &(head ++ .{"--quiet"}),
-        2 => &head,
-        inline else => |v| &(head ++ .{"-" ++ "v" ** (v - 2)}),
-    };
+    }, .{});
 }
 
 /// Returns an equivalent local fs store for the given local daemon store if possible.

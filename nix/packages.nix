@@ -14,7 +14,7 @@
           ../src
         ];
 
-        zigDepsHash = "sha256-njH1sIBzV41de0G86dbSVrpGKaNp/kyMRkXHaTIfjxE=";
+        zigDepsHash = "sha256-WEPQFQMr5ANGpZhoTXLYs+Mv/hk6aGYlRavP2sY1vd8=";
 
         meta.mainProgram = "nix-sigstop";
       };
