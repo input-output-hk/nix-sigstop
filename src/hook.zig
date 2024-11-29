@@ -214,19 +214,25 @@ pub fn main(allocator: std.mem.Allocator, nix_config_env: nix.Config) !u8 {
                     };
                 }
 
-                // TODO parse into `std.json.ArrayHashMap` instead
-                const drv_show_parsed = try std.json.parseFromSlice(std.json.Value, allocator, drv_show_result.stdout, .{});
+                const drv_show_parsed = try std.json.parseFromSlice(std.json.ArrayHashMap(struct {
+                    outputs: std.json.ArrayHashMap(struct {
+                        path: []const u8,
+                    }),
+                }), allocator, drv_show_result.stdout, .{
+                    .ignore_unknown_fields = true,
+                });
                 defer drv_show_parsed.deinit();
 
-                const outputs_info = drv_show_parsed.value.object.get(drv.drv_path).?.object
-                    .get("outputs").?.object;
+                std.debug.assert(drv_show_parsed.value.map.count() == 1);
+                const outputs_info = drv_show_parsed.value.map.get(drv.drv_path).?
+                    .outputs.map;
 
                 var outputs = std.ArrayListUnmanaged([]const u8){};
                 defer outputs.deinit(allocator);
 
                 try outputs.ensureUnusedCapacity(allocator, outputs_info.count());
                 for (outputs_info.values()) |output_info|
-                    outputs.appendAssumeCapacity(output_info.object.get("path").?.string);
+                    outputs.appendAssumeCapacity(output_info.path);
 
                 try (root.Event{ .start = drv }).emit(allocator, fifo, log.scope);
 
