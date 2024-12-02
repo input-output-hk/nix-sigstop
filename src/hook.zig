@@ -15,6 +15,8 @@ pub fn main(allocator: std.mem.Allocator, nix_config_env: nix.Config) !u8 {
     return switch (try hook(allocator, nix_config_env)) {
         .exit => |status| status,
         .notify => |args| notify: {
+            errdefer comptime unreachable;
+
             defer {
                 for (args.output_lockfile_paths) |output_lockfile_path|
                     allocator.free(output_lockfile_path);
