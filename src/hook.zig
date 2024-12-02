@@ -107,13 +107,6 @@ fn hook(allocator: std.mem.Allocator, nix_config_env: nix.Config) !union(enum) {
         allocator.free(store);
     }
 
-    log.debug("opening FIFO for IPC", .{});
-    var fifo = std.fs.openFileAbsolute(fifo_path, .{ .mode = .write_only }) catch |err| {
-        log.err("{s}: failed to open path to FIFO for IPC: {s}", .{ @errorName(err), fifo_path });
-        return err;
-    };
-    defer fifo.close();
-
     // `NIX_HELD_LOCKS` only has an effect on local fs stores.
     const local_store = if (isLocalStore(store)) null else try daemonStoreAsLocalStore(allocator, store);
     defer if (local_store) |ls| allocator.free(ls);
@@ -214,7 +207,7 @@ fn hook(allocator: std.mem.Allocator, nix_config_env: nix.Config) !union(enum) {
             .postpone => try connection.postpone(),
             // XXX Cache `decline_permanently` so that we don't have
             // to ask the build hook for the remaining derivations.
-            .decline, .decline_permanently => switch (try daemonizeToBecomeBuildNotifier(allocator, verbosity, fifo, drv, null)) {
+            .decline, .decline_permanently => switch (try daemonizeToBecomeBuildNotifier(allocator, verbosity, fifo_path, drv, null)) {
                 .exit => |caller| switch (caller) {
                     .parent => try connection.decline(),
                     .intermediate => return .{ .exit = 0 },
@@ -227,7 +220,7 @@ fn hook(allocator: std.mem.Allocator, nix_config_env: nix.Config) !union(enum) {
 
                 try nix.wire.writeStruct(nix.build_hook.BuildIo, hook_stdin_writer, build_io);
 
-                switch (try daemonizeToBecomeBuildNotifier(allocator, verbosity, fifo, drv, build_io.wanted_outputs)) {
+                switch (try daemonizeToBecomeBuildNotifier(allocator, verbosity, fifo_path, drv, build_io.wanted_outputs)) {
                     .exit => |caller| switch (caller) {
                         .parent => break,
                         .intermediate =>
@@ -326,7 +319,7 @@ const DaemonizeParent = utils.enums.Sub(
 fn daemonizeToBecomeBuildNotifier(
     allocator: std.mem.Allocator,
     verbosity: nix.log.Action.Verbosity,
-    fifo: std.fs.File,
+    fifo_path: []const u8,
     drv: nix.build_hook.Derivation,
     wanted_outputs: ?[]const []const u8,
 ) !union(enum) {
@@ -355,6 +348,13 @@ fn daemonizeToBecomeBuildNotifier(
             // but first let's do all allocations and fallible calls
             // in case we want to log an error.
 
+            log.debug("opening FIFO for IPC", .{});
+            var fifo = std.fs.openFileAbsolute(fifo_path, .{ .mode = .write_only }) catch |err| {
+                log.err("{s}: failed to open path to FIFO for IPC: {s}", .{ @errorName(err), fifo_path });
+                return err;
+            };
+            errdefer fifo.close();
+
             try (root.Event{ .start = drv }).emit(fifo);
             errdefer |err| (root.Event{ .done = drv.drv_path }).emit(fifo) catch |emit_err|
                 log.err("{s}: failed to emit done event on error: {s}", .{ @errorName(emit_err), @errorName(err) });
@@ -365,9 +365,6 @@ fn daemonizeToBecomeBuildNotifier(
                     allocator.free(output_lockfile_path);
                 allocator.free(output_lockfile_paths);
             }
-
-            const fifo_dup = std.fs.File{ .handle = try std.posix.dup(fifo.handle) };
-            errdefer fifo_dup.close();
 
             const drv_path = try allocator.dupe(u8, drv.drv_path);
             errdefer allocator.free(drv_path);
@@ -381,7 +378,7 @@ fn daemonizeToBecomeBuildNotifier(
             std.io.getStdErr().close();
 
             break :daemon .{ .notify = .{
-                .fifo = fifo_dup,
+                .fifo = fifo,
                 .drv_path = drv_path,
                 .output_lockfile_paths = output_lockfile_paths,
             } };
