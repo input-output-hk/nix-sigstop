@@ -314,7 +314,7 @@ fn processHookStderr(stderr_reader: anytype, protocol_writer: anytype) !void {
 }
 
 const DaemonizeParent = utils.enums.Sub(
-    @typeInfo(utils.meta.FnErrorUnionPayload(@TypeOf(posix.daemonize))).Union.tag_type.?,
+    @typeInfo(@typeInfo(@TypeOf(posix.daemonize(false))).ErrorUnion.payload).Union.tag_type.?,
     &.{ .parent, .intermediate },
 );
 
@@ -333,14 +333,23 @@ fn daemonizeToBecomeBuildNotifier(
     exit: DaemonizeParent,
     notify: NotifierArgs,
 } {
-    return switch (posix.daemonize() catch |err| {
+    return switch (posix.daemonize(true) catch |err| {
         log.err("{s}: failed to daemonize", .{@errorName(err)});
         // XXX Should be able to just `return err` but it seems that fails peer type resolution.
         // Could this be a compiler bug? This only happens if we have an `errdefer` with capture
         // in the enclosing block. In our case this is the `errdefer` that sends the done event.
-        return @as(utils.meta.FnErrorSet(@TypeOf(posix.daemonize))!utils.meta.FnErrorUnionPayload(@TypeOf(daemonizeToBecomeBuildNotifier)), err);
+        return @as(posix.DaemonizeError(true)!utils.meta.FnErrorUnionPayload(@TypeOf(daemonizeToBecomeBuildNotifier)), err);
     }) {
-        inline else => |_, tag| .{ .exit = std.enums.nameCast(DaemonizeParent, tag) },
+        .parent => |daemon_pid| parent: {
+            // We cannot log in the intermediate child
+            // because the stderr mutex that the log function uses
+            // is not shared across forked processes,
+            // leading to intermingled log messages
+            // that the nix daemon cannot parse.
+            log.info("spawned build notifier daemon with PID {d} for {s}", .{ daemon_pid, drv.drv_path });
+            break :parent .{ .exit = .parent };
+        },
+        .intermediate => .{ .exit = .intermediate },
         .daemon => daemon: {
             // We're about to close stdio as daemons should
             // but first let's do all allocations and fallible calls
