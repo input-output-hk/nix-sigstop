@@ -313,6 +313,8 @@ fn processEvents(
     pid: std.process.Child.Id,
     proxy_daemon_socket_ctrl: *utils.posix.ProxyDuplexControl,
 ) !void {
+    errdefer |err| std.debug.panic("{s}: error processing hook events", .{@errorName(err)});
+
     var num_building: usize = 0;
 
     std.log.debug("opening FIFO for IPC: {s}", .{fifo_path});
@@ -404,7 +406,10 @@ fn processEvents(
                             // the nix client process is running
                             // because our `done` pipe is broken.
                         },
-                        else => |e| return e,
+                        // XXX Should be able to just `return err` but it seems that fails peer type resolution.
+                        // Could this be a compiler bug? This only happens if we have an `errdefer` with capture
+                        // in the enclosing block. In our case this is the `errdefer` that panics.
+                        else => |e| return @as(utils.meta.FnErrorSet(@TypeOf(std.posix.kill))!void, e),
                     };
                     try proxy_daemon_socket_ctrl.unignore(.downstream);
                 }
