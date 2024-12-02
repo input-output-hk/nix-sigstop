@@ -340,16 +340,21 @@ fn processEvents(
         const num_building_before_events = num_building;
 
         while (true) {
-            const fifo_readable = poller.fifo(.fifo).readableSlice(0);
+            const poller_fifo = poller.fifo(.fifo);
+
+            const fifo_readable = poller_fifo.readableSliceOfLen(poller_fifo.readableLength());
 
             if (std.mem.indexOfScalarPos(u8, fifo_readable, fifo_readable_checked_len, '\n')) |end_pos| {
                 fifo_readable_checked_len = 0;
 
-                var fifo_json_reader = std.json.reader(allocator, std.io.limitedReader(poller.fifo(.fifo).reader(), end_pos + 1));
-                defer fifo_json_reader.deinit();
+                const event = try std.json.parseFromSlice(Event, allocator, fifo_readable[0..end_pos], .{});
+                defer {
+                    event.deinit();
 
-                const event = try std.json.parseFromTokenSource(Event, allocator, &fifo_json_reader, .{});
-                defer event.deinit();
+                    // `event` refers to memory in `poller_fifo`'s buffer
+                    // so we need to make sure not to discard it before freeing `event`.
+                    poller_fifo.discard(end_pos + 1);
+                }
 
                 switch (event.value) {
                     .start => |drv| {
