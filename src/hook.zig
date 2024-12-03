@@ -328,6 +328,18 @@ fn daemonizeToBecomeBuildNotifier(
     exit: DaemonizeParent,
     notify: NotifierArgs,
 } {
+    var free = true;
+
+    const output_lockfile_paths = try derivationOutputLockfilePaths(allocator, verbosity, drv.drv_path, wanted_outputs);
+    defer if (free) {
+        for (output_lockfile_paths) |output_lockfile_path|
+            allocator.free(output_lockfile_path);
+        allocator.free(output_lockfile_paths);
+    };
+
+    const drv_path = try allocator.dupe(u8, drv.drv_path);
+    defer if (free) allocator.free(drv_path);
+
     return switch (posix.daemonize(true) catch |err| {
         log.err("{s}: failed to daemonize", .{@errorName(err)});
         // XXX Should be able to just `return err` but it seems that fails peer type resolution.
@@ -357,6 +369,9 @@ fn daemonizeToBecomeBuildNotifier(
                 .daemon => daemon: {
                     root.globals = .build_notifier;
 
+                    free = false;
+                    errdefer free = true;
+
                     var fifo = std.fs.openFileAbsolute(fifo_path, .{ .mode = .write_only }) catch |err|
                         std.debug.panic("{s}: failed to open path to FIFO for IPC: {s}", .{ @errorName(err), fifo_path });
                     errdefer fifo.close();
@@ -364,16 +379,6 @@ fn daemonizeToBecomeBuildNotifier(
                     try (root.Event{ .start = drv }).emit(fifo);
                     errdefer |err| (root.Event{ .done = drv.drv_path }).emit(fifo) catch |emit_err|
                         std.debug.panic("{s}: failed to emit done event on error: {s}", .{ @errorName(emit_err), @errorName(err) });
-
-                    const output_lockfile_paths = try derivationOutputLockfilePaths(allocator, verbosity, drv.drv_path, wanted_outputs);
-                    errdefer {
-                        for (output_lockfile_paths) |output_lockfile_path|
-                            allocator.free(output_lockfile_path);
-                        allocator.free(output_lockfile_paths);
-                    }
-
-                    const drv_path = try allocator.dupe(u8, drv.drv_path);
-                    errdefer allocator.free(drv_path);
 
                     break :daemon .{ .notify = .{
                         .fifo = fifo,
