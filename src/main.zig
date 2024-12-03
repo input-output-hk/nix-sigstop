@@ -10,6 +10,7 @@ const hook = @import("hook.zig");
 pub const std_options = .{
     .log_scope_levels = &.{
         .{ .scope = .hook, .level = .debug },
+        .{ .scope = .notifier, .level = .err },
     },
 
     .logFn = struct {

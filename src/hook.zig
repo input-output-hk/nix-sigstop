@@ -336,54 +336,52 @@ fn daemonizeToBecomeBuildNotifier(
         return @as(posix.DaemonizeError(true)!utils.meta.FnErrorUnionPayload(@TypeOf(daemonizeToBecomeBuildNotifier)), err);
     }) {
         .parent => |daemon_pid| parent: {
-            // We cannot log in the intermediate child
+            log.info("spawned build notifier daemon with PID {d} for {s}", .{ daemon_pid, drv.drv_path });
+            break :parent .{ .exit = .parent };
+        },
+        inline .intermediate, .daemon => |_, caller| caller: {
+            // We cannot log in the intermediate child and daemon
             // because the stderr mutex that the log function uses
             // is not shared across forked processes,
             // leading to intermingled log messages
             // that the nix daemon cannot parse.
-            log.info("spawned build notifier daemon with PID {d} for {s}", .{ daemon_pid, drv.drv_path });
-            break :parent .{ .exit = .parent };
-        },
-        .intermediate => .{ .exit = .intermediate },
-        .daemon => daemon: {
-            // We're about to close stdio as daemons should
-            // but first let's do all allocations and fallible calls
-            // in case we want to log an error.
-
-            log.debug("opening FIFO for IPC", .{});
-            var fifo = std.fs.openFileAbsolute(fifo_path, .{ .mode = .write_only }) catch |err| {
-                log.err("{s}: failed to open path to FIFO for IPC: {s}", .{ @errorName(err), fifo_path });
-                return err;
-            };
-            errdefer fifo.close();
-
-            try (root.Event{ .start = drv }).emit(fifo);
-            errdefer |err| (root.Event{ .done = drv.drv_path }).emit(fifo) catch |emit_err|
-                log.err("{s}: failed to emit done event on error: {s}", .{ @errorName(emit_err), @errorName(err) });
-
-            const output_lockfile_paths = try derivationOutputLockfilePaths(allocator, verbosity, drv.drv_path, wanted_outputs);
-            errdefer {
-                for (output_lockfile_paths) |output_lockfile_path|
-                    allocator.free(output_lockfile_path);
-                allocator.free(output_lockfile_paths);
-            }
-
-            const drv_path = try allocator.dupe(u8, drv.drv_path);
-            errdefer allocator.free(drv_path);
-
-            errdefer comptime unreachable;
-
-            root.globals = .build_notifier;
-
+            // Close stdio, especially stderr, to ensure an error upon logging attempts
+            // instead of sending intermingled messages to the nix daemon.
             std.io.getStdIn().close();
             std.io.getStdOut().close();
             std.io.getStdErr().close();
 
-            break :daemon .{ .notify = .{
-                .fifo = fifo,
-                .drv_path = drv_path,
-                .output_lockfile_paths = output_lockfile_paths,
-            } };
+            break :caller switch (caller) {
+                .parent => comptime unreachable,
+                .intermediate => .{ .exit = .intermediate },
+                .daemon => daemon: {
+                    root.globals = .build_notifier;
+
+                    var fifo = std.fs.openFileAbsolute(fifo_path, .{ .mode = .write_only }) catch |err|
+                        std.debug.panic("{s}: failed to open path to FIFO for IPC: {s}", .{ @errorName(err), fifo_path });
+                    errdefer fifo.close();
+
+                    try (root.Event{ .start = drv }).emit(fifo);
+                    errdefer |err| (root.Event{ .done = drv.drv_path }).emit(fifo) catch |emit_err|
+                        std.debug.panic("{s}: failed to emit done event on error: {s}", .{ @errorName(emit_err), @errorName(err) });
+
+                    const output_lockfile_paths = try derivationOutputLockfilePaths(allocator, verbosity, drv.drv_path, wanted_outputs);
+                    errdefer {
+                        for (output_lockfile_paths) |output_lockfile_path|
+                            allocator.free(output_lockfile_path);
+                        allocator.free(output_lockfile_paths);
+                    }
+
+                    const drv_path = try allocator.dupe(u8, drv.drv_path);
+                    errdefer allocator.free(drv_path);
+
+                    break :daemon .{ .notify = .{
+                        .fifo = fifo,
+                        .drv_path = drv_path,
+                        .output_lockfile_paths = output_lockfile_paths,
+                    } };
+                },
+            };
         },
     };
 }
