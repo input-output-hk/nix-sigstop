@@ -411,6 +411,7 @@ fn derivationOutputLockfilePaths(
         break :result try std.process.Child.run(.{
             .allocator = allocator,
             .argv = args,
+            .max_output_bytes = utils.mem.b_per_mib,
         });
     };
     defer {
