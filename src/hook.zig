@@ -397,7 +397,7 @@ fn derivationOutputLockfilePaths(
     drv_path: []const u8,
     wanted_outputs: ?[]const []const u8,
 ) ![]const []const u8 {
-    const drv_show_result = result: {
+    const drv_info_parsed = drv_info_parsed: {
         const args = try std.mem.concat(allocator, []const u8, &.{
             nixCli(verbosity),
             &.{
@@ -408,33 +408,41 @@ fn derivationOutputLockfilePaths(
         });
         defer allocator.free(args);
 
-        break :result try std.process.Child.run(.{
-            .allocator = allocator,
-            .argv = args,
-            .max_output_bytes = utils.mem.b_per_mib,
-        });
+        var process = std.process.Child.init(args, allocator);
+        process.stdin_behavior = .Close;
+        process.stdout_behavior = .Pipe;
+        process.stderr_behavior = .Ignore;
+        try process.spawn();
+
+        const drv_info_parsed_eu = drv_info_parsed_eu: {
+            var json_reader = std.json.reader(allocator, process.stdout.?.reader());
+            defer json_reader.deinit();
+
+            break :drv_info_parsed_eu std.json.parseFromTokenSource(
+                std.json.ArrayHashMap(struct {
+                    outputs: std.json.ArrayHashMap(struct {
+                        path: []const u8,
+                    }),
+                }),
+                allocator,
+                &json_reader,
+                .{ .ignore_unknown_fields = true },
+            );
+        };
+        errdefer if (drv_info_parsed_eu) |drv_info_parsed| drv_info_parsed.deinit() else |_| {};
+
+        const term = try process.wait();
+        if (term != .Exited or term.Exited != 0) {
+            log.err("`nix derivation show {s}` terminated with {}", .{ drv_path, term });
+            return error.NixDerivationShow;
+        }
+
+        break :drv_info_parsed try drv_info_parsed_eu;
     };
-    defer {
-        allocator.free(drv_show_result.stdout);
-        allocator.free(drv_show_result.stderr);
-    }
+    defer drv_info_parsed.deinit();
 
-    if (drv_show_result.term != .Exited or drv_show_result.term.Exited != 0) {
-        log.err("`nix derivation show {s}` terminated with {}", .{ drv_path, drv_show_result.term });
-        return error.NixDerivationShow;
-    }
-
-    const drv_show_parsed = try std.json.parseFromSlice(std.json.ArrayHashMap(struct {
-        outputs: std.json.ArrayHashMap(struct {
-            path: []const u8,
-        }),
-    }), allocator, drv_show_result.stdout, .{
-        .ignore_unknown_fields = true,
-    });
-    defer drv_show_parsed.deinit();
-
-    std.debug.assert(drv_show_parsed.value.map.count() == 1);
-    const outputs_info = drv_show_parsed.value.map.get(drv_path).?
+    std.debug.assert(drv_info_parsed.value.map.count() == 1);
+    const outputs_info = drv_info_parsed.value.map.get(drv_path).?
         .outputs.map;
 
     var output_lockfile_paths = try std.ArrayListUnmanaged([]const u8).initCapacity(
