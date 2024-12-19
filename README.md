@@ -45,13 +45,12 @@ Here is the flow in a bit more detail:
 3. The nix client starts the evaluation and tells the nix daemon to start a build.
 4. The nix daemon starts nix-sigstop as a build hook.
 5. nix-sigstop as build hook spawns the actual build hook and proxies the communication between it and the nix daemon.
-6. When the actual build hook accepts a build, it waits for it to finish and notifies the wrapper via the FIFO.
-7. When the actual build hook declines a build, it spawns a daemon that waits for the build to finish by acquiring locks of all the build's output paths and notifies the wrapper via the FIFO.
-8. The wrapper is notified of the first started build and sends `SIGSTOP` to the nix client.
-9. While the nix client is stopped, any messages the nix daemon sends into the proxy socket are buffered.
-10. The wrapper is notified of the last finished build and sends `SIGCONT` to the nix client.
-11. The nix client catches up on all the buffered messages from the nix daemon.
-12. When the nix client exits, the wrapper shuts down.
+6. When the actual build hook accepts or declines a build, it spawns a daemon that waits for the build to finish by acquiring locks of all the build's output paths and notifies the wrapper via the FIFO.
+7. The wrapper is notified of the first started build and sends `SIGSTOP` to the nix client.
+8. While the nix client is stopped, any messages the nix daemon sends into the proxy socket are buffered.
+9. The wrapper is notified of the last finished build and sends `SIGCONT` to the nix client.
+10. The nix client catches up on all the buffered messages from the nix daemon.
+11. When the nix client exits, the wrapper shuts down.
 
 ## Caveats
 
