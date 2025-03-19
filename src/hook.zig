@@ -309,7 +309,7 @@ fn processHookStderr(stderr_reader: anytype, protocol_writer: anytype) !void {
 }
 
 const DaemonizeParent = utils.enums.Sub(
-    @typeInfo(@typeInfo(@TypeOf(posix.daemonize(false))).ErrorUnion.payload).Union.tag_type.?,
+    @typeInfo(@typeInfo(@TypeOf(posix.daemonize(false))).error_union.payload).@"union".tag_type.?,
     &.{ .parent, .intermediate },
 );
 

@@ -10,11 +10,16 @@ pub fn build(b: *std.Build) !void {
 
     const exe = b.addExecutable(.{
         .name = "nix-sigstop",
-        .root_source_file = b.path("src/main.zig"),
-        .target = opts.target,
-        .optimize = opts.optimize,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .target = opts.target,
+            .optimize = opts.optimize,
+            .imports = &.{
+                .{ .name = "utils", .module = b.dependency("utils", opts).module("utils") },
+                .{ .name = "known-folders", .module = b.dependency("known-folders", opts).module("known-folders") },
+            },
+        }),
     });
-    addDependencyImports(b, &exe.root_module, opts);
     b.installArtifact(exe);
 
     const run_step = b.step("run", "Run the app");
@@ -29,23 +34,12 @@ pub fn build(b: *std.Build) !void {
     const test_step = b.step("test", "Run unit tests");
     {
         const exe_test = b.addTest(.{
-            .root_source_file = exe.root_module.root_source_file.?,
-            .target = opts.target,
-            .optimize = opts.optimize,
+            .root_module = exe.root_module,
         });
-        addDependencyImports(b, &exe_test.root_module, opts);
 
         const run_exe_test = b.addRunArtifact(exe_test);
         test_step.dependOn(&run_exe_test.step);
     }
 
     _ = utils.addCheckTls(b);
-}
-
-fn addDependencyImports(b: *std.Build, module: *std.Build.Module, opts: struct {
-    target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
-}) void {
-    module.addImport("utils", b.dependency("utils", opts).module("utils"));
-    module.addImport("known-folders", b.dependency("known-folders", opts).module("known-folders"));
 }

@@ -7,14 +7,14 @@ const nix = utils.nix;
 
 const hook = @import("hook.zig");
 
-pub const std_options = .{
+pub const std_options = std.Options{
     .log_scope_levels = &.{
         .{ .scope = .hook, .level = .debug },
         .{ .scope = .notifier, .level = .err },
     },
 
     .logFn = struct {
-        fn logFn(comptime message_level: std.log.Level, comptime scope: @Type(.EnumLiteral), comptime format: []const u8, args: anytype) void {
+        fn logFn(comptime message_level: std.log.Level, comptime scope: @Type(.enum_literal), comptime format: []const u8, args: anytype) void {
             switch (globals) {
                 .wrapper => std.log.defaultLog(message_level, scope, format, args),
                 .build_hook => nix.log.logFn(message_level, scope, format, args),
@@ -68,11 +68,14 @@ pub fn main() !u8 {
 
     std.log.debug("reading nix config from environment", .{});
     const nix_config_env = nix_config_env: {
-        var diagnostics: nix.ChildProcessDiagnostics = undefined;
+        var diagnostics: nix.ConfigDiagnostics = undefined;
         errdefer |err| switch (err) {
             error.CouldNotReadNixConfig => {
-                defer diagnostics.deinit(allocator);
-                std.log.err("could not read nix config: {}, stderr: {s}", .{ diagnostics.term, diagnostics.stderr });
+                defer diagnostics.CouldNotReadNixConfig.deinit(allocator);
+                std.log.err("could not read nix config: {}, stderr: {s}", .{
+                    diagnostics.CouldNotReadNixConfig.term,
+                    diagnostics.CouldNotReadNixConfig.stderr,
+                });
             },
             else => {},
         };
@@ -127,8 +130,8 @@ pub fn main() !u8 {
             .mask = std.posix.empty_sigset,
             .flags = std.posix.SA.RESETHAND,
         };
-        try std.posix.sigaction(std.posix.SIG.TERM, &sa, null);
-        try std.posix.sigaction(std.posix.SIG.INT, &sa, null);
+        std.posix.sigaction(std.posix.SIG.TERM, &sa, null);
+        std.posix.sigaction(std.posix.SIG.INT, &sa, null);
     }
 
     const state_dir_path = if (try known_folders.getPath(allocator, .data)) |known_folder_path| state_dir_path: {
@@ -184,14 +187,19 @@ pub fn main() !u8 {
             if (std.mem.eql(u8, arg_flag, "--store")) break :store arg_value;
         } else nix_config_env.value.store.value;
 
-        var diagnostics: nix.ChildProcessDiagnostics = undefined;
-        errdefer |err| {
-            defer diagnostics.deinit(allocator);
-            std.log.err(
-                "{s}: `nix store info --store {s}` terminated with {}\nstderr: {s}",
-                .{ @errorName(err), store, diagnostics.term, diagnostics.stderr },
-            );
-        }
+        var diagnostics: nix.StoreInfoDiagnostics = undefined;
+        errdefer |err| switch (err) {
+            error.CouldNotPingNixStore => {
+                defer diagnostics.CouldNotPingNixStore.deinit(allocator);
+                std.log.err("{s}: `nix store info --store {s}` terminated with {}\nstderr: {s}", .{
+                    @errorName(err),
+                    store,
+                    diagnostics.CouldNotPingNixStore.term,
+                    diagnostics.CouldNotPingNixStore.stderr,
+                });
+            },
+            else => {},
+        };
         break :store_info try nix.storeInfo(allocator, store, &diagnostics);
     };
     defer store_info.deinit();
@@ -245,7 +253,7 @@ pub fn main() !u8 {
 
         const build_hook_arg = try std.mem.concat(allocator, u8, &.{
             self_exe: {
-                var self_exe_buf: [std.fs.MAX_PATH_BYTES]u8 = undefined;
+                var self_exe_buf: [std.fs.max_path_bytes]u8 = undefined;
                 break :self_exe try std.fs.selfExePath(&self_exe_buf);
             },
             " ",
@@ -498,13 +506,13 @@ fn proxyDaemonSocket(
 
                     const reason = @call(.auto, utils.posix.proxyDuplex, .{
                         allocator_,
-                        .{
+                        utils.posix.ProxyDuplexOptions.ComptimeOptions{
                             .downstream_kind = .socket,
                             .upstream_kind = .socket,
                         },
                         connection_.stream.handle,
                         upstream_.handle,
-                        .{
+                        utils.posix.ProxyDuplexOptions{
                             .cancel = done_.handle,
                             .control = control_,
                             .fifo_max_size = utils.mem.b_per_gib,

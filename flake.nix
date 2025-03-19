@@ -2,6 +2,7 @@
   inputs = {
     nixpkgs.url = github:NixOS/nixpkgs/nixpkgs-unstable;
     parts.url = github:hercules-ci/flake-parts;
+    make-shell.url = github:nicknovitski/make-shell;
     treefmt-nix = {
       url = github:numtide/treefmt-nix;
       inputs.nixpkgs.follows = "nixpkgs";

@@ -1,14 +1,16 @@
 .{
-    .name = "nix-sigstop",
+    .name = .nix_sigstop,
     .version = "0.0.0",
+    .fingerprint = 0xc2d1551cfd00b1a0,
+    .minimum_zig_version = "0.14.0",
     .dependencies = .{
         .@"known-folders" = .{
-            .url = "https://github.com/ziglibs/known-folders/archive/1cceeb70e77dec941a4178160ff6c8d05a74de6f.tar.gz",
-            .hash = "12205f5e7505c96573f6fc5144592ec38942fb0a326d692f9cddc0c7dd38f9028f29",
+            .url = "https://github.com/ziglibs/known-folders/archive/aa24df42183ad415d10bc0a33e6238c437fc0f59.tar.gz",
+            .hash = "known_folders-0.0.0-Fy-PJtLDAADGDOwYwMkVydMSTp_aN-nfjCZw6qPQ2ECL",
         },
         .utils = .{
-            .url = "https://github.com/dermetfan/utils.zig/archive/0f88a57e526c13e9680aa52b329e67ec9d7bb3ac.tar.gz",
-            .hash = "12201975c16e7e81bd9e375723b4e9a2b26a0f3d9f7ceea3565628b886d66bdcb516",
+            .url = "https://github.com/dermetfan/utils.zig/archive/ae3bc56c1b202ed6392ab8738e097bdf4ade449f.tar.gz",
+            .hash = "utils-0.0.0-5JJlDy7OAgAtvfg62xlL_jKJ6AI8X_dzHvxWkxGRgKzY",
         },
     },
     .paths = .{
